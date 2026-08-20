@@ -1,0 +1,82 @@
+# Manual CI wrapper for the Nitjsefnie-OSC fork of BlazeDB.
+#
+# Generic on purpose: it takes any ref in this repository via `target_ref` and
+# runs the repository's own preflight gate (swift build + Tier 0) on Linux with
+# Swift 6.2. The toolchain setup mirrors the upstream PR-gate "Linux (Swift 6.2)"
+# job in .github/workflows/ci.yml. No per-branch logic belongs in this file.
+
+name: OSC Manual Preflight
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: "Branch, tag or SHA in this repository to test"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  linux-preflight:
+    name: Linux (Swift 6.2) — preflight
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout target_ref
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 0
+
+      - name: Provenance
+        run: |
+          echo "Tested commit: $(git rev-parse HEAD) (resolved from target_ref '${{ inputs.target_ref }}')"
+          git log -1 --format='%H%n%an%n%s'
+
+      - name: Cache SwiftPM build
+        uses: actions/cache@v5
+        with:
+          path: .build
+          key: ${{ runner.os }}-osc-manual-spm-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-osc-manual-spm-
+
+      - name: Setup Swift 6.2
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.2"
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Prepare log directories
+        run: mkdir -p .logs .artifacts
+
+      - name: Preflight (swift build + Tier 0)
+        run: |
+          set -euo pipefail
+          ./Scripts/preflight.sh 2>&1 | tee .logs/preflight.log
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          mkdir -p .logs
+          df -h > .logs/disk.txt || true
+          swift --version > .logs/swift-version.txt 2>&1 || true
+
+      - name: Upload preflight logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: osc-manual-preflight-logs
+          path: |
+            .logs/
+            .artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
