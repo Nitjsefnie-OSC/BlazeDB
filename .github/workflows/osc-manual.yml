@@ -55,6 +55,16 @@ jobs:
       - name: Swift version
         run: swift --version
 
+      # Scripts/check-durability-lane-integrity.sh (invoked by the Tier 0 gate)
+      # shells out to ripgrep, which the ubuntu runner image does not ship.
+      # Upstream's Linux lane calls `swift test` directly and so never needs it.
+      - name: Install preflight host dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+          rg --version
+
       - name: Prepare log directories
         run: mkdir -p .logs .artifacts
 
