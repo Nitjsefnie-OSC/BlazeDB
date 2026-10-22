@@ -1,0 +1,110 @@
+# Manual mutation probe for the Nitjsefnie-OSC fork of BlazeDB (claim: kdf441).
+#
+# Proves the no-leak regression guard bites: applies ONE named single-line mutant
+# (NonCryptoKDFIsolationTests inheriting the relief harness) to target_ref, runs the
+# isolation suite expecting RED, reverts, runs it again expecting GREEN. The job
+# fails unless the mutant run fails AND the control run passes. Toolchain setup
+# mirrors the upstream PR-gate Linux job. No per-branch logic beyond the named
+# claim this file exists for.
+
+name: OSC KDF 441 Mutation Probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: "Branch, tag or SHA in this repository to probe"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  mutation-probe:
+    name: Inheritance mutant — NonCryptoKDFIsolationTests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout target_ref
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 0
+
+      - name: Provenance
+        run: |
+          echo "Tested commit: $(git rev-parse HEAD) (resolved from target_ref '${{ inputs.target_ref }}')"
+          git log -1 --format='%H%n%an%n%s'
+
+      - name: Setup Swift 6.2
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.2"
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Prepare log directories
+        run: mkdir -p .logs
+
+      - name: Mutant run (expected RED)
+        run: |
+          set -euo pipefail
+          BEFORE=$(grep -c 'final class NonCryptoKDFIsolationTests: XCTestCase {' BlazeDBTests/Tier1Core/Helpers/NonCryptoKDFHarnessTests.swift)
+          echo "declarations before: $BEFORE"
+          test "$BEFORE" -eq 1
+          sed -i 's/final class NonCryptoKDFIsolationTests: XCTestCase {/final class NonCryptoKDFIsolationTests: NonCryptoKDFHarness {/' BlazeDBTests/Tier1Core/Helpers/NonCryptoKDFHarnessTests.swift
+          AFTER=$(grep -c 'final class NonCryptoKDFIsolationTests: NonCryptoKDFHarness {' BlazeDBTests/Tier1Core/Helpers/NonCryptoKDFHarnessTests.swift)
+          echo "declarations after: $AFTER"
+          test "$AFTER" -eq 1
+          set +e
+          swift test --filter NonCryptoKDFIsolationTests 2>&1 | tee .logs/mutant-run.log
+          RC=${PIPESTATUS[0]}
+          set -e
+          echo "mutant-rc=$RC" | tee .logs/mutant-rc.txt
+          test "$RC" -ne 0 || {
+            echo "::error::mutant run PASSED — the no-leak guard does not bite"
+            exit 1
+          }
+
+      - name: Control run after revert (expected GREEN)
+        run: |
+          set -euo pipefail
+          git checkout -- BlazeDBTests/Tier1Core/Helpers/NonCryptoKDFHarnessTests.swift
+          git diff --exit-code --stat
+          set +e
+          swift test --filter NonCryptoKDFIsolationTests 2>&1 | tee .logs/control-run.log
+          RC=${PIPESTATUS[0]}
+          set -e
+          echo "control-rc=$RC" | tee .logs/control-rc.txt
+          test "$RC" -eq 0 || {
+            echo "::error::control run FAILED — tree did not revert cleanly or suite is red unmutated"
+            exit 1
+          }
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "## Mutation probe evidence"
+            echo
+            echo '```'
+            test -f .logs/mutant-rc.txt && cat .logs/mutant-rc.txt || true
+            test -f .logs/control-rc.txt && cat .logs/control-rc.txt || true
+            test -f .logs/mutant-run.log && grep -E 'XCTAssert|failed|Executed' .logs/mutant-run.log | sed -n '1,40p' || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: osc-kdf441-mutation-logs
+          path: .logs/
+          if-no-files-found: ignore
+          retention-days: 7
