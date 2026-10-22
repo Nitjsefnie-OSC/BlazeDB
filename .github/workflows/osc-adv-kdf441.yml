@@ -1,0 +1,85 @@
+# Manual evidence wrapper for the Nitjsefnie-OSC fork of BlazeDB.
+#
+# Generic on purpose: takes any ref in this repository via `target_ref` and runs
+# the repository's own core-test script (./Scripts/run-core-tests.sh) on Linux
+# with Swift 6.2, reporting wall-clock and parsed test counts. The toolchain
+# setup mirrors the upstream PR-gate "Linux (Swift 6.2)" job in
+# .github/workflows/ci.yml. No per-branch logic belongs in this file.
+#
+# Deliberately NO SwiftPM cache: a restored cache would both contaminate the
+# before/after timing comparison and reintroduce the workspace-path
+# incompatibility tracked in the fork's cache issue.
+
+name: OSC KDF 441 Evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: "Branch, tag or SHA in this repository to test"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  linux-core-tests:
+    name: Linux (Swift 6.2) — run-core-tests.sh
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout target_ref
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 0
+
+      - name: Provenance
+        run: |
+          echo "Tested commit: $(git rev-parse HEAD) (resolved from target_ref '${{ inputs.target_ref }}')"
+          git log -1 --format='%H%n%an%n%s'
+
+      - name: Setup Swift 6.2
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.2"
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Prepare log directories
+        run: mkdir -p .logs
+
+      - name: Core tests (before/after evidence)
+        run: |
+          set -euo pipefail
+          /usr/bin/time -p ./Scripts/run-core-tests.sh 2>&1 | tee .logs/run-core-tests.log
+
+      - name: Summarize counts and timing
+        if: always()
+        run: |
+          {
+            echo "## Core test evidence"
+            echo
+            echo '```'
+            grep -E '^(real|user|sys)' .logs/run-core-tests.log || true
+            echo "executed-lines: $(grep -cE '^Test [a-zA-Z].*(passed|failed)' .logs/run-core-tests.log || true)"
+            echo "failed-lines: $(grep -cE '^Test [a-zA-Z].*failed' .logs/run-core-tests.log || true)"
+            echo "executed-totals: $(grep -oE 'Executed [0-9]+ tests' .logs/run-core-tests.log | sort | uniq -c | tr '\n' ' ')"
+            echo "failure-summaries: $(grep -cE 'with [1-9][0-9]* failure' .logs/run-core-tests.log || true)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: osc-kdf441-evidence-logs
+          path: .logs/
+          if-no-files-found: ignore
+          retention-days: 7
