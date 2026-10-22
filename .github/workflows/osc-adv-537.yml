@@ -1,0 +1,287 @@
+name: OSC ADV 537 — Android SDK cache-state probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: "Branch, tag or SHA in this repository to test"
+        required: true
+        type: string
+      mode:
+        description: "seed = warm caches; probe = test warm and cold SDK installation"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  seed:
+    if: inputs.mode == 'seed'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    env:
+      # Pre-set on GitHub runner images; conflicts with the Swift Android SDK bundle.
+      ANDROID_NDK_ROOT: ""
+
+    steps:
+      - name: Checkout target_ref
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 0
+
+      - name: SwiftPM cache identity
+        id: cache-identity
+        run: |
+          set -euo pipefail
+          workspace="$(printf '%s' "$(git rev-parse --show-toplevel)" | git hash-object --stdin)"
+          echo "workspace=${workspace:0:12}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Android Swift SDK artifact
+        uses: actions/cache@v5
+        with:
+          path: .artifacts/android-sdk
+          key: android-swift-sdk-artifact-6.3.2-${{ hashFiles('Scripts/android-swift-config.sh') }}
+          restore-keys: |
+            android-swift-sdk-artifact-6.3.2-
+
+      - name: Cache OSS Swift host toolchain
+        uses: actions/cache@v5
+        with:
+          path: .swift-host
+          key: android-host-swift-6.3.2-${{ hashFiles('Scripts/android-swift-config.sh') }}
+          restore-keys: |
+            android-host-swift-6.3.2-
+
+      - name: Cache SwiftPM build
+        uses: actions/cache@v5
+        with:
+          path: |
+            .build
+            ~/.swiftpm/swift-sdks
+            ~/.config/swiftpm/swift-sdks
+          key: ${{ runner.os }}-android-sdk-v2-${{ steps.cache-identity.outputs.workspace }}-${{ hashFiles('Scripts/android-swift-config.sh') }}-${{ hashFiles('Package.swift', 'Package.resolved', 'Scripts/android-swift-config.sh', 'Scripts/install-android-swift.sh', 'Scripts/ci-android-cross-compile.sh', 'Scripts/fetch-android-sdk-artifact.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-android-sdk-v2-${{ steps.cache-identity.outputs.workspace }}-${{ hashFiles('Scripts/android-swift-config.sh') }}-
+
+      - name: Cache Android NDK
+        uses: actions/cache@v5
+        with:
+          path: |
+            .artifacts/android-sdk/swift-6.3.2-RELEASE_android.artifactbundle/swift-android/android-ndk-r27d
+            ~/.config/swiftpm/swift-sdks/swift-6.3.2-RELEASE_android.artifactbundle/swift-android/android-ndk-r27d
+          # NDK path follows BLAZEDB_ANDROID_NDK_VERSION in Scripts/android-swift-config.sh
+          key: android-ndk-r27d-linux-v2
+          restore-keys: |
+            android-ndk-r27d-linux-
+
+      - name: Install OSS Swift (Android host toolchain)
+        run: |
+          set -euo pipefail
+          chmod +x ./Scripts/install-android-swift.sh ./Scripts/ci-android-cross-compile.sh
+          ./Scripts/install-android-swift.sh
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Cross-compile BlazeDBAndroidBridge for Android
+        run: |
+          set -euo pipefail
+          mkdir -p .logs .artifacts
+          ./Scripts/ci-android-cross-compile.sh 2>&1 | tee .logs/android-cross-compile.log
+
+      - name: Upload Android cache-state probe logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: osc-adv-537-${{ github.job }}-logs
+          path: |
+            .logs/
+            .artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  bite-prefix:
+    if: inputs.mode == 'probe'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    env:
+      # Pre-set on GitHub runner images; conflicts with the Swift Android SDK bundle.
+      ANDROID_NDK_ROOT: ""
+
+    steps:
+      - name: Checkout target_ref
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 0
+
+      - name: Cache Android Swift SDK artifact
+        uses: actions/cache/restore@v5
+        with:
+          path: .artifacts/android-sdk
+          key: android-swift-sdk-artifact-6.3.2-${{ hashFiles('Scripts/android-swift-config.sh') }}
+          restore-keys: |
+            android-swift-sdk-artifact-6.3.2-
+
+      - name: Cache OSS Swift host toolchain
+        uses: actions/cache/restore@v5
+        with:
+          path: .swift-host
+          key: android-host-swift-6.3.2-${{ hashFiles('Scripts/android-swift-config.sh') }}
+          restore-keys: |
+            android-host-swift-6.3.2-
+
+      - name: Cache Android NDK
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            .artifacts/android-sdk/swift-6.3.2-RELEASE_android.artifactbundle/swift-android/android-ndk-r27d
+            ~/.config/swiftpm/swift-sdks/swift-6.3.2-RELEASE_android.artifactbundle/swift-android/android-ndk-r27d
+          # NDK path follows BLAZEDB_ANDROID_NDK_VERSION in Scripts/android-swift-config.sh
+          key: android-ndk-r27d-linux-v2
+          restore-keys: |
+            android-ndk-r27d-linux-
+
+      - name: Install OSS Swift (Android host toolchain)
+        run: |
+          set -euo pipefail
+          chmod +x ./Scripts/install-android-swift.sh ./Scripts/ci-android-cross-compile.sh
+          ./Scripts/install-android-swift.sh
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Cross-compile BlazeDBAndroidBridge for Android
+        run: |
+          set -euo pipefail
+          mkdir -p .logs .artifacts
+          ./Scripts/ci-android-cross-compile.sh 2>&1 | tee .logs/android-cross-compile.log
+
+      - name: Upload Android cache-state probe logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: osc-adv-537-${{ github.job }}-logs
+          path: |
+            .logs/
+            .artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  fixed-warm:
+    if: inputs.mode == 'probe'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    env:
+      # Pre-set on GitHub runner images; conflicts with the Swift Android SDK bundle.
+      ANDROID_NDK_ROOT: ""
+
+    steps:
+      - name: Checkout target_ref
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 0
+
+      - name: Cache Android Swift SDK artifact
+        uses: actions/cache/restore@v5
+        with:
+          path: .artifacts/android-sdk
+          key: android-swift-sdk-artifact-6.3.2-${{ hashFiles('Scripts/android-swift-config.sh') }}
+          restore-keys: |
+            android-swift-sdk-artifact-6.3.2-
+
+      - name: Cache OSS Swift host toolchain
+        uses: actions/cache/restore@v5
+        with:
+          path: .swift-host
+          key: android-host-swift-6.3.2-${{ hashFiles('Scripts/android-swift-config.sh') }}
+          restore-keys: |
+            android-host-swift-6.3.2-
+
+      - name: Cache Android NDK
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            .artifacts/android-sdk/swift-6.3.2-RELEASE_android.artifactbundle/swift-android/android-ndk-r27d
+            ~/.config/swiftpm/swift-sdks/swift-6.3.2-RELEASE_android.artifactbundle/swift-android/android-ndk-r27d
+          # NDK path follows BLAZEDB_ANDROID_NDK_VERSION in Scripts/android-swift-config.sh
+          key: android-ndk-r27d-linux-v2
+          restore-keys: |
+            android-ndk-r27d-linux-
+
+      - name: Install OSS Swift (Android host toolchain)
+        run: |
+          set -euo pipefail
+          chmod +x ./Scripts/install-android-swift.sh ./Scripts/ci-android-cross-compile.sh
+          ./Scripts/install-android-swift.sh
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Cross-compile BlazeDBAndroidBridge for Android
+        run: |
+          set -euo pipefail
+          mkdir -p .logs .artifacts
+          ./Scripts/ci-android-cross-compile.sh 2>&1 | tee .logs/android-cross-compile.log
+
+      - name: Upload Android cache-state probe logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: osc-adv-537-${{ github.job }}-logs
+          path: |
+            .logs/
+            .artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  fixed-cold:
+    if: inputs.mode == 'probe'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    env:
+      # Pre-set on GitHub runner images; conflicts with the Swift Android SDK bundle.
+      ANDROID_NDK_ROOT: ""
+
+    steps:
+      - name: Checkout target_ref
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 0
+
+      - name: Install OSS Swift (Android host toolchain)
+        run: |
+          set -euo pipefail
+          chmod +x ./Scripts/install-android-swift.sh ./Scripts/ci-android-cross-compile.sh
+          ./Scripts/install-android-swift.sh
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Cross-compile BlazeDBAndroidBridge for Android
+        run: |
+          set -euo pipefail
+          mkdir -p .logs .artifacts
+          ./Scripts/ci-android-cross-compile.sh 2>&1 | tee .logs/android-cross-compile.log
+
+      - name: Upload Android cache-state probe logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: osc-adv-537-${{ github.job }}-logs
+          path: |
+            .logs/
+            .artifacts/
+          if-no-files-found: ignore
+          retention-days: 7

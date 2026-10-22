@@ -39,14 +39,6 @@ jobs:
           echo "Tested commit: $(git rev-parse HEAD) (resolved from target_ref '${{ inputs.target_ref }}')"
           git log -1 --format='%H%n%an%n%s'
 
-      - name: Cache SwiftPM build
-        uses: actions/cache@v5
-        with:
-          path: .build
-          key: ${{ runner.os }}-osc-manual-spm-${{ hashFiles('Package.swift', 'Package.resolved') }}
-          restore-keys: |
-            ${{ runner.os }}-osc-manual-spm-
-
       - name: Setup Swift 6.2
         uses: swift-actions/setup-swift@v2
         with:
@@ -54,6 +46,29 @@ jobs:
 
       - name: Swift version
         run: swift --version
+
+      - name: SwiftPM cache identity
+        id: cache-identity
+        run: |
+          set -euo pipefail
+          workspace="$(printf '%s' "$(git rev-parse --show-toplevel)" | git hash-object --stdin)"
+          toolchain="$(swift --version | sed -n '1p' | git hash-object --stdin)"
+          echo "workspace=${workspace:0:12}" >> "$GITHUB_OUTPUT"
+          echo "toolchain=${toolchain:0:12}" >> "$GITHUB_OUTPUT"
+          if [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ]; then
+            echo "save=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "save=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cache SwiftPM build
+        id: spm-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: .build
+          key: ${{ runner.os }}-osc-manual-spm-${{ steps.cache-identity.outputs.workspace }}-${{ steps.cache-identity.outputs.toolchain }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-osc-manual-spm-${{ steps.cache-identity.outputs.workspace }}-${{ steps.cache-identity.outputs.toolchain }}-
 
       # Scripts/check-durability-lane-integrity.sh (invoked by the Tier 0 gate)
       # shells out to ripgrep, which the ubuntu runner image does not ship.
@@ -72,6 +87,13 @@ jobs:
         run: |
           set -euo pipefail
           ./Scripts/preflight.sh 2>&1 | tee .logs/preflight.log
+
+      - name: Save SwiftPM build cache
+        if: always() && steps.spm-cache.outputs.cache-hit != 'true' && steps.cache-identity.outputs.save == '1'
+        uses: actions/cache/save@v5
+        with:
+          path: .build
+          key: ${{ steps.spm-cache.outputs.cache-primary-key }}
 
       - name: Dump diagnostics on failure
         if: failure()
