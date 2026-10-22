@@ -130,6 +130,13 @@ jobs:
           path: .build
           key: probe-448-fixed-${{ runner.os }}-ws${{ steps.ids.outputs.ws-a }}-tc${{ steps.ids.outputs.tc }}-${{ steps.ids.outputs.manifest }}
 
+      - name: Archive phase A build payload
+        if: steps.buildA.outcome == 'success'
+        run: |
+          set -euo pipefail
+          mv .build .build-phase-a
+          echo "phase A payload archived as .build-phase-a ($(ls .build-phase-a | wc -l) entries)"
+
       - name: Checkout into changed workspace path B
         uses: actions/checkout@v7
         with:
@@ -218,6 +225,10 @@ jobs:
           set -euo pipefail
           TC_C="$(swift --version | sed -n '1p' | git hash-object --stdin | cut -c1-12)"
           echo "tc-c=$TC_C (phase A tc was ${{ steps.ids.outputs.tc }})"
+          if [ "$TC_C" = "${{ steps.ids.outputs.tc }}" ]; then
+            echo "toolchain identity did not change; phase C is inconclusive"
+            exit 1
+          fi
           echo "tc-c=$TC_C" >> "$GITHUB_OUTPUT"
 
       - name: Phase C — restore under changed toolchain (fixed mode; expect miss)
@@ -232,7 +243,7 @@ jobs:
 
       - name: Phase D — restore across a changed manifest, prefix mode (expect broad-fallback hit)
         id: restoreDp
-        if: inputs.mode == 'prefix'
+        if: always() && inputs.mode == 'prefix'
         uses: actions/cache/restore@v4
         with:
           path: .build
@@ -242,7 +253,7 @@ jobs:
 
       - name: Phase D — restore across a changed manifest, fixed mode (expect identity-scoped fallback hit)
         id: restoreDf
-        if: inputs.mode == 'fixed'
+        if: always() && inputs.mode == 'fixed'
         uses: actions/cache/restore@v4
         with:
           path: .build
@@ -257,7 +268,6 @@ jobs:
           echo "phase-A restore hit: prefix=${{ steps.restoreAp.outputs.cache-hit }} fixed=${{ steps.restoreAf.outputs.cache-hit }}"
           echo "phase-B restore hit: prefix=${{ steps.restoreBp.outputs.cache-hit }} fixed=${{ steps.restoreBf.outputs.cache-hit }}"
           echo "phase-B restore matched key: prefix='${{ steps.restoreBp.outputs.cache-matched-key }}' fixed='${{ steps.restoreBf.outputs.cache-matched-key }}'"
-          echo "phase-B payload at changed path: $(ls "$GITHUB_WORKSPACE/alt-448/.build" 2>/dev/null | wc -l) entries"
           echo "phase-C toolchain id: ${{ steps.idsc.outputs.tc-c }} (phase-A was ${{ steps.ids.outputs.tc }})"
           echo "phase-C restore hit: ${{ steps.restoreC.outputs.cache-hit }} matched: '${{ steps.restoreC.outputs.cache-matched-key }}'"
           echo "phase-D restore hit: prefix=${{ steps.restoreDp.outputs.cache-hit }} fixed=${{ steps.restoreDf.outputs.cache-hit }}"
