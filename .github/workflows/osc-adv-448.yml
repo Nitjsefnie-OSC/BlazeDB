@@ -1,0 +1,194 @@
+# OSC cache portability probe for Mikedan37/BlazeDB issue 448.
+#
+# Demonstrates on this fork's runners the cache-restore semantics the PR gate
+# owes issue #448. One workflow, two modes:
+#
+#   mode=prefix — the pre-fix PR-gate cache design (OS + package-manifest key,
+#                 broad OS-only restore prefix). Expected: the changed-path
+#                 restore HITS an incompatible cache and the build under the
+#                 changed path fails before tests (the issue's failure).
+#   mode=fixed  — the post-fix PR-gate cache design (workspace path + Swift
+#                 toolchain identity in the exact key AND in the restore
+#                 prefix). Expected: the changed-path restore MISSES cleanly
+#                 and the build under the changed path reaches its tests; the
+#                 same-path phase restores from cache when one exists.
+#
+# Both phases run in one job: phase A builds at the default workspace path and
+# saves `.build`; phase B checks out the same ref under a different absolute
+# path and rebuilds against the restored cache. The `probe-448-` key namespace
+# is used by this probe only, so probe saves can never feed a real workflow's
+# cache. Generic on purpose: no per-branch logic. Delete with its evidence
+# once the issue's work ships.
+
+name: OSC 448 Cache Portability Probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: "Ref (SHA preferred) in this fork to check out and build"
+        required: true
+        type: string
+      mode:
+        description: "prefix = pre-fix cache design (expected red); fixed = post-fix design (expected green)"
+        required: true
+        type: choice
+        default: fixed
+        options:
+          - prefix
+          - fixed
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  probe:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            label: "Linux — cache portability probe"
+          - os: macos-15
+            label: "macOS 15 — cache portability probe"
+
+    steps:
+      - name: Checkout (workspace path A)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 0
+
+      - name: Setup Swift 6.2 (Linux)
+        if: matrix.os == 'ubuntu-22.04'
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.2"
+
+      - name: Cache identities
+        id: ids
+        run: |
+          set -euo pipefail
+          REPO_ROOT="$(git rev-parse --show-toplevel)"
+          WS_ID="$(printf '%s' "$REPO_ROOT" | git hash-object --stdin | cut -c1-12)"
+          TC_ID="$(swift --version | head -1 | git hash-object --stdin | cut -c1-12)"
+          MANIFEST="$(git hash-object Package.swift Package.resolved | git hash-object --stdin | cut -c1-12)"
+          echo "repo-root=$REPO_ROOT"
+          echo "ws-a=$WS_ID  tc=$TC_ID  manifest=$MANIFEST"
+          echo "ws-a=$WS_ID" >> "$GITHUB_OUTPUT"
+          echo "tc=$TC_ID" >> "$GITHUB_OUTPUT"
+          echo "manifest=$MANIFEST" >> "$GITHUB_OUTPUT"
+
+      - name: Restore cache at path A — prefix mode
+        id: restoreAp
+        if: inputs.mode == 'prefix'
+        uses: actions/cache/restore@v4
+        with:
+          path: .build
+          key: probe-448-prefix-${{ runner.os }}-${{ steps.ids.outputs.manifest }}
+          restore-keys: |
+            probe-448-prefix-${{ runner.os }}-
+
+      - name: Restore cache at path A — fixed mode
+        id: restoreAf
+        if: inputs.mode == 'fixed'
+        uses: actions/cache/restore@v4
+        with:
+          key: probe-448-fixed-${{ runner.os }}-ws${{ steps.ids.outputs.ws-a }}-tc${{ steps.ids.outputs.tc }}-${{ steps.ids.outputs.manifest }}
+          restore-keys: |
+            probe-448-fixed-${{ runner.os }}-ws${{ steps.ids.outputs.ws-a }}-tc${{ steps.ids.outputs.tc }}-
+
+      - name: Build at workspace path A
+        id: buildA
+        run: swift build
+
+      - name: Save cache — prefix mode
+        if: inputs.mode == 'prefix' && steps.buildA.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: .build
+          key: probe-448-prefix-${{ runner.os }}-${{ steps.ids.outputs.manifest }}
+
+      - name: Save cache — fixed mode
+        if: inputs.mode == 'fixed' && steps.buildA.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: .build
+          key: probe-448-fixed-${{ runner.os }}-ws${{ steps.ids.outputs.ws-a }}-tc${{ steps.ids.outputs.tc }}-${{ steps.ids.outputs.manifest }}
+
+      - name: Checkout into changed workspace path B
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 0
+          path: alt-448
+
+      - name: Path B identity
+        id: idsb
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/alt-448"
+          REPO_ROOT="$(git rev-parse --show-toplevel)"
+          echo "ws-b=$(printf '%s' "$REPO_ROOT" | git hash-object --stdin | cut -c1-12)"
+          echo "ws-b=$(printf '%s' "$REPO_ROOT" | git hash-object --stdin | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
+      - name: Install preflight host dependencies (Linux)
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+          rg --version
+
+      - name: Restore cache under changed path — prefix mode
+        id: restoreBp
+        if: inputs.mode == 'prefix'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/alt-448/.build
+          key: probe-448-prefix-${{ runner.os }}-${{ steps.ids.outputs.manifest }}
+          restore-keys: |
+            probe-448-prefix-${{ runner.os }}-
+
+      - name: Restore cache under changed path — fixed mode
+        id: restoreBf
+        if: inputs.mode == 'fixed'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/alt-448/.build
+          key: probe-448-fixed-${{ runner.os }}-ws${{ steps.idsb.outputs.ws-b }}-tc${{ steps.ids.outputs.tc }}-${{ steps.ids.outputs.manifest }}
+          restore-keys: |
+            probe-448-fixed-${{ runner.os }}-ws${{ steps.idsb.outputs.ws-b }}-tc${{ steps.ids.outputs.tc }}-
+
+      - name: Build under changed workspace path (Linux)
+        id: buildBl
+        if: matrix.os == 'ubuntu-22.04'
+        working-directory: ${{ github.workspace }}/alt-448
+        run: |
+          set -euo pipefail
+          ./Scripts/preflight.sh
+
+      - name: Build under changed workspace path (macOS)
+        id: buildBm
+        if: matrix.os == 'macos-15'
+        working-directory: ${{ github.workspace }}/alt-448
+        run: |
+          set -euo pipefail
+          swift build --target BlazeDBCore
+          mkdir -p .logs
+          BLAZEDB_TEST_SCOPE=tier0 swift test --filter BlazeDB_Tier0 2>&1 | tee .logs/tier0-probe.log
+
+      - name: Probe verdict (log evidence)
+        if: always()
+        run: |
+          echo "mode=${{ inputs.mode }}"
+          echo "phase-A restore hit: prefix=${{ steps.restoreAp.outputs.cache-hit }} fixed=${{ steps.restoreAf.outputs.cache-hit }}"
+          echo "phase-B restore hit: prefix=${{ steps.restoreBp.outputs.cache-hit }} fixed=${{ steps.restoreBf.outputs.cache-hit }}"
+          echo "phase-B restore matched key: prefix='${{ steps.restoreBp.outputs.cache-matched-key }}' fixed='${{ steps.restoreBf.outputs.cache-matched-key }}'"
+          echo "phase-B build outcome: Linux=${{ steps.buildBl.outcome }} macOS=${{ steps.buildBm.outcome }}"
