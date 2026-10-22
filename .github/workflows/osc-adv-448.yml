@@ -1,4 +1,4 @@
-# OSC cache portability probe for Mikedan37/BlazeDB issue 448.
+# OSC cache portability probe v2 for Mikedan37/BlazeDB issue 448.
 #
 # Demonstrates on this fork's runners the cache-restore semantics the PR gate
 # owes issue #448. One workflow, two modes:
@@ -6,19 +6,26 @@
 #   mode=prefix — the pre-fix PR-gate cache design (OS + package-manifest key,
 #                 broad OS-only restore prefix). Expected: the changed-path
 #                 restore HITS an incompatible cache and the build under the
-#                 changed path fails before tests (the issue's failure).
+#                 changed path fails before tests (the issue's failure); the
+#                 broad fallback also matches under a changed manifest.
 #   mode=fixed  — the post-fix PR-gate cache design (workspace path + Swift
 #                 toolchain identity in the exact key AND in the restore
 #                 prefix). Expected: the changed-path restore MISSES cleanly
-#                 and the build under the changed path reaches its tests; the
-#                 same-path phase restores from cache when one exists.
+#                 and the build under the changed path reaches its tests
+#                 cache-cold; the same-path phase restores from cache when
+#                 one exists; a changed toolchain misses; a same-path
+#                 same-toolchain cache still falls back across a manifest
+#                 change.
 #
-# Both phases run in one job: phase A builds at the default workspace path and
-# saves `.build`; phase B checks out the same ref under a different absolute
-# path and rebuilds against the restored cache. The `probe-448-` key namespace
-# is used by this probe only, so probe saves can never feed a real workflow's
-# cache. Generic on purpose: no per-branch logic. Delete with its evidence
-# once the issue's work ships.
+# Transport paths are identical in every save and restore (`.build`), so the
+# actions/cache cache version is constant across phases and any miss or hit is
+# attributable to the key design alone; the restored payload is relocated into
+# the changed checkout before its build and the relocation is counted. Phase C
+# installs a second, real Swift toolchain (6.1) to vary the toolchain
+# identity; phase D varies only the manifest suffix to exercise the fallback.
+# The `probe-448-` key namespace is used by this probe only, so probe saves
+# can never feed a real workflow's cache. Generic on purpose: no per-branch
+# logic. Delete with its evidence once the issue's work ships.
 
 name: OSC 448 Cache Portability Probe
 
@@ -77,7 +84,7 @@ jobs:
           set -euo pipefail
           REPO_ROOT="$(git rev-parse --show-toplevel)"
           WS_ID="$(printf '%s' "$REPO_ROOT" | git hash-object --stdin | cut -c1-12)"
-          TC_ID="$(swift --version | head -1 | git hash-object --stdin | cut -c1-12)"
+          TC_ID="$(swift --version | sed -n '1p' | git hash-object --stdin | cut -c1-12)"
           MANIFEST="$(git hash-object Package.swift Package.resolved | git hash-object --stdin | cut -c1-12)"
           echo "repo-root=$REPO_ROOT"
           echo "ws-a=$WS_ID  tc=$TC_ID  manifest=$MANIFEST"
@@ -100,6 +107,7 @@ jobs:
         if: inputs.mode == 'fixed'
         uses: actions/cache/restore@v4
         with:
+          path: .build
           key: probe-448-fixed-${{ runner.os }}-ws${{ steps.ids.outputs.ws-a }}-tc${{ steps.ids.outputs.tc }}-${{ steps.ids.outputs.manifest }}
           restore-keys: |
             probe-448-fixed-${{ runner.os }}-ws${{ steps.ids.outputs.ws-a }}-tc${{ steps.ids.outputs.tc }}-
@@ -151,7 +159,7 @@ jobs:
         if: inputs.mode == 'prefix'
         uses: actions/cache/restore@v4
         with:
-          path: ${{ github.workspace }}/alt-448/.build
+          path: .build
           key: probe-448-prefix-${{ runner.os }}-${{ steps.ids.outputs.manifest }}
           restore-keys: |
             probe-448-prefix-${{ runner.os }}-
@@ -161,10 +169,22 @@ jobs:
         if: inputs.mode == 'fixed'
         uses: actions/cache/restore@v4
         with:
-          path: ${{ github.workspace }}/alt-448/.build
+          path: .build
           key: probe-448-fixed-${{ runner.os }}-ws${{ steps.idsb.outputs.ws-b }}-tc${{ steps.ids.outputs.tc }}-${{ steps.ids.outputs.manifest }}
           restore-keys: |
             probe-448-fixed-${{ runner.os }}-ws${{ steps.idsb.outputs.ws-b }}-tc${{ steps.ids.outputs.tc }}-
+
+      - name: Relocate restored cache into changed path
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -d .build ]; then
+            rm -rf alt-448/.build
+            mv .build alt-448/.build
+            echo "relocated cache payload: $(ls alt-448/.build | wc -l) entries"
+          else
+            echo "no cache restored; build under changed path runs cache-cold"
+          fi
 
       - name: Build under changed workspace path (Linux)
         id: buildBl
@@ -184,6 +204,52 @@ jobs:
           mkdir -p .logs
           BLAZEDB_TEST_SCOPE=tier0 swift test --filter BlazeDB_Tier0 2>&1 | tee .logs/tier0-probe.log
 
+      - name: Phase C — switch Swift toolchain (fixed mode)
+        if: inputs.mode == 'fixed'
+        continue-on-error: true
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.1"
+
+      - name: Phase C identities (fixed mode)
+        id: idsc
+        if: inputs.mode == 'fixed'
+        run: |
+          set -euo pipefail
+          TC_C="$(swift --version | sed -n '1p' | git hash-object --stdin | cut -c1-12)"
+          echo "tc-c=$TC_C (phase A tc was ${{ steps.ids.outputs.tc }})"
+          echo "tc-c=$TC_C" >> "$GITHUB_OUTPUT"
+
+      - name: Phase C — restore under changed toolchain (fixed mode; expect miss)
+        id: restoreC
+        if: inputs.mode == 'fixed'
+        uses: actions/cache/restore@v4
+        with:
+          path: .build
+          key: probe-448-fixed-${{ runner.os }}-ws${{ steps.ids.outputs.ws-a }}-tc${{ steps.idsc.outputs.tc-c }}-${{ steps.ids.outputs.manifest }}
+          restore-keys: |
+            probe-448-fixed-${{ runner.os }}-ws${{ steps.ids.outputs.ws-a }}-tc${{ steps.idsc.outputs.tc-c }}-
+
+      - name: Phase D — restore across a changed manifest, prefix mode (expect broad-fallback hit)
+        id: restoreDp
+        if: inputs.mode == 'prefix'
+        uses: actions/cache/restore@v4
+        with:
+          path: .build
+          key: probe-448-prefix-${{ runner.os }}-000000000000
+          restore-keys: |
+            probe-448-prefix-${{ runner.os }}-
+
+      - name: Phase D — restore across a changed manifest, fixed mode (expect identity-scoped fallback hit)
+        id: restoreDf
+        if: inputs.mode == 'fixed'
+        uses: actions/cache/restore@v4
+        with:
+          path: .build
+          key: probe-448-fixed-${{ runner.os }}-ws${{ steps.ids.outputs.ws-a }}-tc${{ steps.ids.outputs.tc }}-000000000000
+          restore-keys: |
+            probe-448-fixed-${{ runner.os }}-ws${{ steps.ids.outputs.ws-a }}-tc${{ steps.ids.outputs.tc }}-
+
       - name: Probe verdict (log evidence)
         if: always()
         run: |
@@ -191,4 +257,9 @@ jobs:
           echo "phase-A restore hit: prefix=${{ steps.restoreAp.outputs.cache-hit }} fixed=${{ steps.restoreAf.outputs.cache-hit }}"
           echo "phase-B restore hit: prefix=${{ steps.restoreBp.outputs.cache-hit }} fixed=${{ steps.restoreBf.outputs.cache-hit }}"
           echo "phase-B restore matched key: prefix='${{ steps.restoreBp.outputs.cache-matched-key }}' fixed='${{ steps.restoreBf.outputs.cache-matched-key }}'"
+          echo "phase-B payload at changed path: $(ls "$GITHUB_WORKSPACE/alt-448/.build" 2>/dev/null | wc -l) entries"
+          echo "phase-C toolchain id: ${{ steps.idsc.outputs.tc-c }} (phase-A was ${{ steps.ids.outputs.tc }})"
+          echo "phase-C restore hit: ${{ steps.restoreC.outputs.cache-hit }} matched: '${{ steps.restoreC.outputs.cache-matched-key }}'"
+          echo "phase-D restore hit: prefix=${{ steps.restoreDp.outputs.cache-hit }} fixed=${{ steps.restoreDf.outputs.cache-hit }}"
+          echo "phase-D matched key: prefix='${{ steps.restoreDp.outputs.cache-matched-key }}' fixed='${{ steps.restoreDf.outputs.cache-matched-key }}'"
           echo "phase-B build outcome: Linux=${{ steps.buildBl.outcome }} macOS=${{ steps.buildBm.outcome }}"
