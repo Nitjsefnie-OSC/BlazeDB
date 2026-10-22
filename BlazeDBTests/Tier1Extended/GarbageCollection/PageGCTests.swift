@@ -129,10 +129,13 @@ final class PageGCTests: XCTestCase {
         
         // Create 5 versions of same record
         for i in 1...5 {
+            let main = i * 10
+            let chain = i <= 3 ? [main, main + 1, main + 2] : [main]
             let version = RecordVersion(
                 recordID: recordID,
                 version: UInt64(i),
-                pageNumber: i * 10,  // Pages: 10, 20, 30, 40, 50
+                pageNumber: main,
+                pageIndices: chain,
                 createdByTransaction: UInt64(i)
             )
             versionManager.addVersion(version)
@@ -141,14 +144,15 @@ final class PageGCTests: XCTestCase {
         let pageStatsBefore = versionManager.pageGC.getStats()
         print("  Free pages before GC: \(pageStatsBefore.freePagesAvailable)")
         
-        // Run GC (should keep only v5, free pages 10, 20, 30, 40)
+        // Run GC (should keep only v5, free pages from v1–v4 including overflow chains)
         let removed = versionManager.garbageCollect()
         
         let pageStatsAfter = versionManager.pageGC.getStats()
         print("  Free pages after GC: \(pageStatsAfter.freePagesAvailable)")
         
         XCTAssertEqual(removed, 4, "Should remove 4 versions")
-        XCTAssertEqual(pageStatsAfter.freePagesAvailable, 4, "Should free 4 pages")
+        // v1–v3: 3 pages each; v4: 1 page → 10 pages total
+        XCTAssertEqual(pageStatsAfter.freePagesAvailable, 10, "Should free every page in retired chains")
         
         print("  ✅ Version GC correctly frees disk pages!")
     }
@@ -366,6 +370,7 @@ final class PageGCTests: XCTestCase {
         
         try requireFixture(db).setMVCCEnabled(true)
         try requireFixture(db).runGarbageCollection()
+        try requireFixture(db).persist()
         
         let sizeBefore = try databaseFileSize()
         
@@ -397,7 +402,10 @@ final class PageGCTests: XCTestCase {
             ids.append(id)
         }
         
+        // Checkpoint WAL so main-file size reflects inserted data (not 0-byte .blazedb).
+        try requireFixture(db).persist()
         let sizeInitial = try databaseFileSize()
+        XCTAssertGreaterThan(sizeInitial, 0, "Baseline file size must be visible on disk before update churn")
         
         // Update each record 10 times (creates 1000 versions!)
         for _ in 0..<10 {

@@ -119,7 +119,12 @@ public final class QueryBuilder: @unchecked Sendable {
     internal var groupByFields: [String] = []
     internal var aggregations: [AggregationType] = []
     internal var havingPredicate: ((AggregationResult) -> Bool)?
-    
+    /// Live RLS/security partition mixed into cache keys. Closure filters are
+    /// recorded as `closure_N`, which does not distinguish tenant context, so
+    /// cached `execute(withCache:)` results would otherwise leak across
+    /// `setRLSContext` switches on the same client.
+    internal var cachePartitionProvider: (() -> String)?
+
     #if !BLAZEDB_LINUX_CORE
     // Advanced query features (spatial, vector, window functions)
     internal var sortByDistanceCenter: SpatialPoint?
@@ -472,7 +477,7 @@ public final class QueryBuilder: @unchecked Sendable {
     
     /// Execute with caching support (unified)
     public func execute(withCache ttl: TimeInterval) throws -> QueryResult {
-        let cacheKey = generateCacheKey()
+        let cacheKey = QueryCacheNamespace.queryResult + generateCacheKey()
         BlazeLogger.debug("Checking cache with key: \(cacheKey.prefix(8))...")
         
         // Try cache first
@@ -744,6 +749,10 @@ public final class QueryBuilder: @unchecked Sendable {
             key += "_c\(collection.instanceID.uuidString)"
         }
 
+        if let partition = cachePartitionProvider?(), !partition.isEmpty {
+            key += "_rls\(partition)"
+        }
+
         // Include filters with their full descriptors (field, operation, value hash)
         if !filterDescriptors.isEmpty {
             var hasher = Hasher()
@@ -753,9 +762,22 @@ public final class QueryBuilder: @unchecked Sendable {
             key += "_f\(hasher.finalize())"
         }
 
-        // Include joins
+        // Include joins. The join count alone lets two queries with the same left
+        // instance and filter shape share an entry while joining different right-hand
+        // collections, so encode each join's right-hand instance, keys and type.
+        // Length-prefix each component so user-provided separators cannot be ambiguous.
         if !joinOperations.isEmpty {
-            key += "_j\(joinOperations.count)"
+            let joinDescriptors = joinOperations.map { operation in
+                [
+                    operation.collection.instanceID.uuidString,
+                    operation.foreignKey,
+                    operation.primaryKey,
+                    String(describing: operation.type)
+                ]
+                .map { "\($0.count):\($0)" }
+                .joined()
+            }
+            key += "_j\(joinOperations.count)[\(joinDescriptors.joined(separator: "|"))]"
         }
 
         // Include sorts
@@ -1162,7 +1184,7 @@ extension QueryBuilder {
     /// More memory-efficient than loading all records at once
     ///
     /// - Parameters:
-    ///   - batchSize: Number of records per batch (default: 100)
+    ///   - size: Number of records per batch (default: 100)
     ///   - handler: Closure called for each batch
     /// - Returns: Total number of records processed
     ///
@@ -1195,7 +1217,7 @@ extension QueryBuilder {
     ///
     /// - Parameters:
     ///   - page: Page number (1-indexed)
-    ///   - pageSize: Number of records per page
+    ///   - size: Number of records per page
     /// - Returns: Records for the specified page
     ///
     /// ## Example

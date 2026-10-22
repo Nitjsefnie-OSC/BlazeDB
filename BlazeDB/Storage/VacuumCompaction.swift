@@ -64,12 +64,13 @@ extension BlazeDBClient {
             let pageGCStats = collection.versionManager.pageGC.getStats()
             let persistedDeletedPages = layout.deletedPages.count
             
-            // Account for both persisted deleted pages and MVCC free pages. These pools are
-            // populated by different code paths, so health checks must consider both before
-            // deciding whether auto-vacuum should run.
+            // Persisted deleted pages are true on-disk slack. MVCC `pageGC.freePages` are
+            // reusable slots inside the current file — counting them as "wasted" triggers
+            // auto-vacuum after normal update/GC churn (free list ≫ active data).
             let pageSize = 4096
             let totalPages = fileSize / pageSize
-            let obsoletePages = persistedDeletedPages + pageGCStats.freePagesAvailable
+            let reusableMVCCPages = collection.mvccEnabled ? 0 : pageGCStats.freePagesAvailable
+            let obsoletePages = persistedDeletedPages + reusableMVCCPages
             
             let activeDataBytes = activePages * pageSize
             let wastedBytes = obsoletePages * pageSize
@@ -152,11 +153,12 @@ extension BlazeDBClient {
 
             let startTime = Date()
 
-            // Flush in-memory state to disk before measuring / copying.
-            // Without this, the .blazedb file may not exist yet if records
-            // are still only in the WAL or in-memory cache.
+            // Flush WAL commits and checkpoint before measuring / copying.
+            // Commits are durable in the WAL after synchronize(); the main file
+            // stays empty until checkpoint (see WALCommitBoundaryTests).
             // We're already inside queue.sync(.barrier), so call store/layout directly.
             try collection.store.synchronize()
+            try collection.store.checkpoint()
             try collection.saveLayout()
 
             // CRASH SAFETY: Write VACUUM intent log

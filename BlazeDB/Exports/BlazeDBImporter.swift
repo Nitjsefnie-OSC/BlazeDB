@@ -33,6 +33,7 @@ public struct BlazeDBImporter {
     ///   - dumpURL: URL of dump file
     ///   - db: Target database client (must be empty or match schema)
     ///   - allowSchemaMismatch: If false, refuses mismatched schemas
+    ///   - allowLegacyHashMismatch: When true, skips strict hash verification for legacy dumps
     /// - Throws: Error if verification fails or restore fails
     ///
     /// ## Example
@@ -75,8 +76,7 @@ public struct BlazeDBImporter {
 
         // Restore in one explicit transaction so large imports avoid per-insert
         // backup snapshots while keeping rollback semantics.
-        try db.beginTransaction()
-        do {
+        try db.transaction {
             // Restore records
             for record in dump.records {
                 // Insert record (ID preserved if present in storage["id"])
@@ -95,10 +95,6 @@ public struct BlazeDBImporter {
                 )
             }
 
-            try db.commitTransaction()
-        } catch {
-            try? db.rollbackTransaction()
-            throw error
         }
     }
     

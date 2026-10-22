@@ -29,7 +29,8 @@ jobs:
   validate:
     name: Validate Release
     runs-on: macos-15
-    timeout-minutes: 60
+    # Tier0+Tier1 only. ~55m observed sequentially; small margin vs stacking Tier2.
+    timeout-minutes: 90
 
     steps:
       - name: Checkout code
@@ -61,11 +62,8 @@ jobs:
           set -euo pipefail
           swift test --filter BlazeDB_Tier1 2>&1 | tee .logs/tier1.log
 
-      - name: Test Tier 2 (+ transitional extended companion)
-        run: |
-          set -euo pipefail
-          swift test --filter BlazeDB_Tier2 2>&1 | tee .logs/tier2.log
-          swift test --filter BlazeDB_Tier2_Extended 2>&1 | tee .logs/tier2-extended.log
+      # Tier2 core + Tier2 Extended stay on Nightly / Deep Validation (see CI_AND_TEST_TIERS.md).
+      # Release asks "safe to publish?" via Tier0+Tier1 only; stacking Tier2 here timed out at 60m.
 
       - name: Run stress tests (+ transitional perf companion)
         if: github.event_name == 'workflow_dispatch' && inputs.run_deep_validation == true
@@ -176,7 +174,20 @@ jobs:
           if [ -z "$LAST_TAG" ]; then
             echo "- Initial release" >> release_notes.md
           else
-            git log $LAST_TAG..HEAD --pretty=format:"- %s" >> release_notes.md
+            git log $LAST_TAG..HEAD --pretty=format:"- %s" \
+              | sed -E 's/@main/`main`/g' >> release_notes.md
+          fi
+
+          echo "" >> release_notes.md
+          echo "### Contributors (this release)" >> release_notes.md
+          echo "" >> release_notes.md
+          if [ -n "$LAST_TAG" ]; then
+            curl -fsSL \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/compare/${LAST_TAG}...${{ github.ref_name }}" \
+              | jq -r '[.commits[].author.login | select(. != null and . != "github-actions[bot]")] | unique | sort | .[] | "- @" + .' \
+              >> release_notes.md || echo "- See the [compare view](https://github.com/${{ github.repository }}/compare/$LAST_TAG...${{ github.ref_name }}) for commit authors." >> release_notes.md
           fi
 
           echo "" >> release_notes.md
@@ -184,6 +195,7 @@ jobs:
           echo "" >> release_notes.md
           echo "- Tier 0 gate tests: passing" >> release_notes.md
           echo "- Tier 1 contract tests: passing" >> release_notes.md
+          echo "- Tier 2 / Extended: owned by Nightly Confidence and Deep Validation (not this lane)" >> release_notes.md
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.run_deep_validation }}" == "true" ]]; then
             echo "- Tier 3 heavy tests: passing" >> release_notes.md
           else
@@ -210,6 +222,8 @@ jobs:
           else
             echo "**Full Changelog**: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}" >> release_notes.md
           fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload release notes
         uses: actions/upload-artifact@v5

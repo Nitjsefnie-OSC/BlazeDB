@@ -12,10 +12,12 @@ For operators using `BlazeDBManager` or other tooling, note that manager-style h
 
 For the default `BlazeDBClient` path, durability is provided by the **legacy binary write-ahead log** at the **page** level:
 
-- **Write ordering**
-- For each page write, the encrypted page image is appended to the binary WAL **before** the main data file is updated.
-- WAL entries may be appended with deferred durability and made durable at a later explicit sync boundary; a page write is considered committed only after its WAL data reaches that durability boundary.
-- The corresponding main-file writes may occur before that boundary; `PageStore.synchronize()` fsyncs the WAL first and then the main data file before catalog or metadata publication.
+- **Write ordering (legacy WAL)**
+- Multi-page and overflow writes batch encrypted page images into the binary WAL; a group is made durable when `PageStore.synchronize()` runs (typically at the end of each insert/update on the default client path).
+- After a durable WAL sync, committed page images are **staged for checkpoint**; the main `.blazedb` file may still report **zero or stale size** until `PageStore.checkpoint()`, `PageStore.close()`, or WAL replay on the next open applies those pages to the main file. This matches `WALCommitBoundaryTests` in Tier 0.
+- **Main-file visibility**
+- `BlazeDBClient.persist()` calls `store.synchronize()`, then **`store.checkpoint()`**, then saves signed metadata. Use `persist()` (or `close()`) before relying on `.blazedb` file size, external copy tools, or VACUUM/compaction that reads the main file.
+- High-level transactions (`beginTransaction` / `commitTransaction`) already checkpoint after `persist()` so backup snapshots see a full main file.
 - **Crash recovery**
 - On open, `PageStore` replays any remaining WAL entries and reapplies the corresponding page images to the main file.
 - WAL replay is idempotent for committed streams: reapplying the same committed WAL sequence converges to a single final state.
@@ -23,7 +25,7 @@ For the default `BlazeDBClient` path, durability is provided by the **legacy bin
 - **Metadata and visibility**
 - Persisted record visibility is determined by the catalog/metadata (`StorageLayout.indexMap`), not by scanning raw pages.
 - A record is considered **published** only after both:
- 1. Its page(s) are durably written (via WAL + main fsync), and
+ 1. Its page(s) are durably committed in the WAL (and, after `persist()` / checkpoint / close, copied to the main file), and
  2. The metadata has been updated and saved.
 - If an insert fails (for example, a metadata save error), `BlazeDBClient.performSafeWrite` restores the in-memory index map; the record is not visible via normal APIs, and reopen will not list it unless the metadata actually contains an entry.
 
@@ -42,7 +44,27 @@ This means:
 - The durability story is **publish-last at the main page/catalog level**: overflow data becomes part of the logical record only once the main page and metadata have been persisted.
 - Operators should be aware that crashes can leave **ghost/orphan overflow pages** that are not referenced by the catalog; these affect disk usage, not logical correctness.
 
+### MVCC updates and page reuse
+
+When MVCC is enabled, each `RecordVersion` stores the full **`pageIndices`** chain (main + overflow), not just the main page. Version garbage collection marks **every** page in a retired generation obsolete for reuse, so records that grow or shrink across the single-page limit do not leak overflow pages on repeated updates.
+
 ## Modes in codebase
+
+### Client transaction rollback
+
+`BlazeDBClient.rollbackTransaction()` restores baseline records across their
+original overflow pages, including records deleted during the transaction. It
+also restores the free-page list so subsequent inserts cannot overwrite those
+restored records. The change uses the existing file format and default legacy
+WAL mode; existing databases do not require migration.
+
+If rollback itself fails, the durable transaction backup remains available.
+The client clears its in-memory transaction state and refuses a new transaction
+until the database is reopened, rather than overwriting the recovery backup.
+Reopening invokes the existing durable transaction recovery path. Callers must
+not treat a failed rollback as a successful save or delete the backup.
+
+After a rollback fails, the client rejects guarded reads, transactions, ordinary CRUD writes, index creation and explicit persistence until it is closed and reopened. Closing skips the normal client flush; reopening restores the durable transaction backup before accepting new writes. The sync and async transaction helpers, `performTransaction`, and import restoration report `BlazeTransactionRecoveryError` when both the operation and rollback fail, retaining both underlying errors. A successful rollback preserves the original operation error.
 
 - **Legacy durability path (default for `BlazeDBClient`):** `WriteAheadLog` + encrypted page writes. WAL replay runs during `PageStore` init.
 - **Unified durability path (optional):** `DurabilityManager` + `RecoveryManager` — selected by constructing `PageStore` with `walMode: .unified`. Use one mode consistently per database file.

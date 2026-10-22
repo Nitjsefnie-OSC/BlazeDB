@@ -177,6 +177,32 @@ public final class DynamicCollection {
         layout.deletedPages = cachedDeletedPages
         return layout
     }
+
+    /// Layout snapshot from memory. The on-disk catalog holds every record's
+    /// index entry, so insert must not decode it to allocate a page.
+    internal func mutationLayoutFromMemory() -> StorageLayout {
+        var layout = StorageLayout(
+            indexMap: indexMap,
+            nextPageIndex: nextPageIndex,
+            secondaryIndexes: [:],
+            searchIndex: nil,
+            searchIndexedFields: []
+        )
+        layout.deletedPages = cachedDeletedPages
+        return layout
+    }
+
+    /// Hand the in-memory free list to the MVCC page GC. Open already loaded
+    /// this list from the catalog; reading the catalog again is O(records).
+    internal func drainCachedDeletedPagesIntoMVCC() {
+        guard mvccEnabled, !cachedDeletedPages.isEmpty else { return }
+        let drained = cachedDeletedPages.count
+        for pageIdx in cachedDeletedPages {
+            versionManager.pageGC.markPageObsolete(pageIdx)
+        }
+        cachedDeletedPages.removeAll()
+        BlazeLogger.debug("♻️ [MVCC] Moved \(drained) cached deleted pages to pageGC")
+    }
     
     internal func rebuildMVCCFromIndexMapIfNeeded() {
         guard mvccEnabled, !self.indexMap.isEmpty else { return }
@@ -190,6 +216,7 @@ public final class DynamicCollection {
                 recordID: recordID,
                 version: baseVersion,
                 pageNumber: firstPageIndex,
+                pageIndices: pageIndices,
                 createdAt: Date(),
                 deletedAt: nil,
                 createdByTransaction: baseVersion,
@@ -702,6 +729,7 @@ public final class DynamicCollection {
                         recordID: recordID,
                         version: baseVersion,
                         pageNumber: firstPageIndex,
+                        pageIndices: pageIndices,
                         createdAt: Date(), // We don't have the original creation time, use current time
                         deletedAt: nil,
                         createdByTransaction: baseVersion,
@@ -898,63 +926,23 @@ public final class DynamicCollection {
                         )
                     }
                     
-                    // Load layout to check for deleted pages that can be reused
-                    var layout = try loadLayoutForMutation()
-                    
-                    // Add deleted pages from layout to MVCC PageGarbageCollector for reuse
-                    // This ensures pages deleted in legacy mode or persisted to disk are available for MVCC reuse
                     BlazeLogger.trace("📝 [INSERT] Single record insert: id=\(id.uuidString.prefix(8))")
-                    if !layout.deletedPages.isEmpty {
-                        for pageIdx in layout.deletedPages {
-                            versionManager.pageGC.markPageObsolete(pageIdx)
-                        }
-                        BlazeLogger.debug("♻️ [MVCC INSERT] Added \(layout.deletedPages.count) deleted pages from layout to pageGC for reuse")
-                        // Remove from layout.deletedPages since they're now in pageGC
-                        layout.deletedPages.removeAll()
-                        // Save layout to persist the change
-                        if password != nil {
-                            try layout.saveSecure(to: metaURL, signingKey: encryptionKey)
-                        } else {
-                            try layout.save(to: metaURL)
-                        }
-                    }
+                    // Free list is already in memory. Do not loadSecure the catalog:
+                    // that JSON document contains indexMap for every record.
+                    drainCachedDeletedPagesIntoMVCC()
                     
-                    // Create MVCC transaction
+                    // Create MVCC transaction. write() returns the pages it allocated;
+                    // indexMap does not contain this id until we publish them after commit.
                     let tx = MVCCTransaction(versionManager: versionManager, pageStore: store)
                     let record = BlazeDataRecord(document)
-                    try tx.write(recordID: id, record: record)
-                    
-                    // Get page number from indexMap (MVCC doesn't expose page numbers directly)
-                    let pageNumber = indexMap[id]?.first
-                    
-                    let transactionID = tx.transactionID  // Capture transaction ID before commit
+                    let pageIndices = try tx.write(recordID: id, record: record)
                     try tx.commit()
                     
                     // Trigger automatic GC (Phase 4)
                     gcManager.onTransactionCommit()
                     
-                    // Also update old indexMap for compatibility (MVCC uses single page)
-                    // Use page number from pending writes (most reliable)
-                    if let pageNum = pageNumber {
-                        indexMap[id] = [pageNum]
-                        BlazeLogger.trace("📝 [INSERT] Single record: id=\(id.uuidString.prefix(8)), page=\(pageNum), indexMap now has \(indexMap.count) entries")
-                    } else {
-                        // Fallback: Try to get from version manager after commit
-                        let currentVersion = versionManager.getCurrentVersion()
-                        if let version = versionManager.getVersion(recordID: id, snapshot: currentVersion) {
-                            indexMap[id] = [version.pageNumber]
-                            BlazeLogger.trace("📝 [INSERT] Single record (fallback 1): id=\(id.uuidString.prefix(8)), page=\(version.pageNumber), indexMap now has \(indexMap.count) entries")
-                        } else if let version = versionManager.getVersion(recordID: id, snapshot: transactionID) {
-                            indexMap[id] = [version.pageNumber]
-                            BlazeLogger.trace("📝 [INSERT] Single record (fallback 2): id=\(id.uuidString.prefix(8)), page=\(version.pageNumber), indexMap now has \(indexMap.count) entries")
-                        } else if let version = versionManager.getVersion(recordID: id, snapshot: .max) {
-                            indexMap[id] = [version.pageNumber]
-                            BlazeLogger.trace("📝 [INSERT] Single record (fallback 3): id=\(id.uuidString.prefix(8)), page=\(version.pageNumber), indexMap now has \(indexMap.count) entries")
-                        } else {
-                            // This should never happen, but log a warning
-                            BlazeLogger.warn("⚠️ [INSERT] Could not find version for record \(id) after insert (transactionID=\(transactionID), currentVersion=\(currentVersion)) - indexMap may be out of sync")
-                        }
-                    }
+                    indexMap[id] = pageIndices
+                    BlazeLogger.trace("📝 [INSERT] Single record: id=\(id.uuidString.prefix(8)), pages=\(pageIndices), indexMap now has \(indexMap.count) entries")
                     
                     // Update all configured secondary indexes in memory immediately
                     for (compound, _) in secondaryIndexes {
@@ -1094,7 +1082,7 @@ public final class DynamicCollection {
                     searchIndex: nil,
                     searchIndexedFields: []
                 )
-                let mainPageIndex: Int = try WriteProfileCollector.measure("transaction.setup") {
+                let mainPageIndex: Int = WriteProfileCollector.measure("transaction.setup") {
                     layout.deletedPages = cachedDeletedPages
                     return allocatePage(layout: &layout)
                 }
@@ -1504,18 +1492,16 @@ public final class DynamicCollection {
                         merged[key] = value
                     }
                     
-                    // Write new version
+                    // Write new version. Publish the pages write() allocated, not a
+                    // lookup of indexMap from before this version existed.
                     let updatedRecord = BlazeDataRecord(merged)
-                    try tx.write(recordID: id, record: updatedRecord)
+                    let pageIndices = try tx.write(recordID: id, record: updatedRecord)
                     try tx.commit()
                     
                     // Trigger automatic GC (Phase 4)
                     gcManager.onTransactionCommit()
                     
-                    // Update indexMap (MVCC stores single page number, convert to array)
-                    if let version = versionManager.getVersion(recordID: id, snapshot: .max) {
-                        indexMap[id] = [version.pageNumber]  // MVCC currently uses single page
-                    }
+                    indexMap[id] = pageIndices
                     
                     // Update secondary indexes: remove old entry, add new entry
                     // Remove old keys from indexes
@@ -2042,8 +2028,9 @@ public final class DynamicCollection {
                     BlazeLogger.error("💾 [PERSIST] \(reason)")
                     throw BlazeDBError.permissionDenied(operation: "persist", path: nil)
                 }
-                // First, ensure all page writes are flushed to disk
+                // Flush WAL commits, then checkpoint so the main .blazedb reflects durable pages.
                 try store.synchronize()
+                try store.checkpoint()
                 
                 // Clear fetchAll cache to ensure fresh reads after persist
                 #if !BLAZEDB_LINUX_CORE

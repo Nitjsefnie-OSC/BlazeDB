@@ -11,13 +11,11 @@ import XCTest
 
 final class PerformanceInvariantTests: XCTestCase {
 
-    /// Absolute timing gates assume fast local hardware; Linux CI runners are too noisy.
-    private func skipTimingSensitiveTestsOnLinuxCI() throws {
-        #if os(Linux)
+    /// Absolute timing gates assume fast local hardware; shared CI runners are too noisy.
+    private func skipTimingSensitiveTestsOnCI() throws {
         if ProcessInfo.processInfo.environment["CI"] != nil {
-            throw XCTSkip("Performance invariant timing tests skipped on Linux CI; run locally or on macOS weekly.")
+            throw XCTSkip("Performance invariant timing tests skipped on CI; run locally for perf signal.")
         }
-        #endif
     }
     
     var tempURL: URL!
@@ -48,7 +46,7 @@ final class PerformanceInvariantTests: XCTestCase {
     
     /// Test: Batch insert should be fast (< 2s for 10k records)
     func testBatchInsert10kPerformance() throws {
-        try skipTimingSensitiveTestsOnLinuxCI()
+        try skipTimingSensitiveTestsOnCI()
         let records = (0..<10000).map { i in
             BlazeDataRecord(["index": .int(i)])
         }
@@ -63,6 +61,7 @@ final class PerformanceInvariantTests: XCTestCase {
     
     /// Test: Individual inserts should be reasonably fast
     func testIndividualInsertPerformance() throws {
+        try skipTimingSensitiveTestsOnCI()
         let start = Date()
         
         for i in 0..<100 {
@@ -80,6 +79,7 @@ final class PerformanceInvariantTests: XCTestCase {
     
     /// Test: Persist should be fast (metadata write only)
     func testPersistPerformance() throws {
+        try skipTimingSensitiveTestsOnCI()
         // Insert 1000 records
         for i in 0..<1000 {
             try db.insert(BlazeDataRecord(["index": .int(i)]))
@@ -96,6 +96,7 @@ final class PerformanceInvariantTests: XCTestCase {
     
     /// Test: Multiple persist calls shouldn't accumulate overhead
     func testMultiplePersistPerformance() throws {
+        try skipTimingSensitiveTestsOnCI()
         for i in 0..<10 {
             try db.insert(BlazeDataRecord(["index": .int(i)]))
         }
@@ -121,6 +122,7 @@ final class PerformanceInvariantTests: XCTestCase {
     
     /// Test: fetchAll on 1000 records should be fast
     func testFetchAllPerformance() throws {
+        try skipTimingSensitiveTestsOnCI()
         // Insert 1000 records
         for i in 0..<1000 {
             try db.insert(BlazeDataRecord(["index": .int(i), "data": .string("Record \(i)")]))
@@ -140,6 +142,7 @@ final class PerformanceInvariantTests: XCTestCase {
     
     /// Test: Query with filter should be fast
     func testQueryWithFilterPerformance() throws {
+        try skipTimingSensitiveTestsOnCI()
         // Insert 1000 records (100 matching)
         for i in 0..<1000 {
             try db.insert(BlazeDataRecord([
@@ -162,6 +165,7 @@ final class PerformanceInvariantTests: XCTestCase {
     
     /// Test: Aggregation on 10k records should be fast
     func testAggregationPerformance() throws {
+        try skipTimingSensitiveTestsOnCI()
         let records = (0..<10000).map { i in
             BlazeDataRecord(["value": .int(i)])
         }
@@ -244,7 +248,7 @@ final class PerformanceInvariantTests: XCTestCase {
     
     /// Test: Memory usage stays reasonable
     func testMemoryUsageReasonable() throws {
-        try skipTimingSensitiveTestsOnLinuxCI()
+        try skipTimingSensitiveTestsOnCI()
         // This is a smoke test - actual memory profiling needs Instruments
         let records = (0..<10000).map { i in
             BlazeDataRecord(["data": .string(String(repeating: "X", count: 100))])
@@ -263,7 +267,7 @@ final class PerformanceInvariantTests: XCTestCase {
     
     /// Test: Reopening database should be fast
     func testReopenPerformance() throws {
-        try skipTimingSensitiveTestsOnLinuxCI()
+        try skipTimingSensitiveTestsOnCI()
         // Create database with 1000 records
         for i in 0..<1000 {
             try db.insert(BlazeDataRecord(["index": .int(i)]))
@@ -291,6 +295,7 @@ final class PerformanceInvariantTests: XCTestCase {
     
     /// Test: Batch updates should be fast
     func testBatchUpdatePerformance() throws {
+        try skipTimingSensitiveTestsOnCI()
         // Insert 1000 records
         var ids: [UUID] = []
         for i in 0..<1000 {
@@ -313,6 +318,7 @@ final class PerformanceInvariantTests: XCTestCase {
     
     /// Test: Batch deletes should be fast
     func testBatchDeletePerformance() throws {
+        try skipTimingSensitiveTestsOnCI()
         // Insert 1000 records
         var ids: [UUID] = []
         for i in 0..<1000 {
@@ -326,11 +332,9 @@ final class PerformanceInvariantTests: XCTestCase {
             try db.delete(id: id)
         }
         let duration = Date().timeIntervalSince(start)
-        let isCI = ProcessInfo.processInfo.environment["CI"] == "true"
-        let threshold = isCI ? 20.0 : 8.0
         
-        XCTAssertLessThan(duration, threshold,
-                         "1000 individual deletes should be < \(String(format: "%.2f", threshold))s, was \(String(format: "%.2f", duration))s")
+        XCTAssertLessThan(duration, 8.0,
+                         "1000 individual deletes should be < 8s, was \(String(format: "%.2f", duration))s")
         
         XCTAssertEqual(try db.count(), 0, "All records should be deleted")
     }

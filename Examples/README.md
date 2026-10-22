@@ -8,7 +8,7 @@ Runnable examples from basic to advanced. Prefer the curated order below for onb
 
 | Order | Example | What you learn | Run command |
 |-------|---------|----------------|-------------|
-| 1 | [HelloBlazeDB](HelloBlazeDB/) | Canonical `open → put → get → query` | `swift run HelloBlazeDB` |
+| 1 | [HelloBlazeDB](HelloBlazeDB/) | Canonical `open → put → get → query → close → reopen` | `swift run HelloBlazeDB` |
 | 2 | [CorePathSmoke](CorePathSmoke/) | Portable core path (`BLAZEDB_LINUX_CORE`) | `swift run CorePathSmoke` |
 | 3 | [MVVMPattern](MVVMPattern/) | Repository + ViewModel without SwiftUI | `swift run MVVMPattern` |
 | 4 | [BasicExample](BasicExample/) | CRUD operations | `swift run BasicExample` |
@@ -22,9 +22,23 @@ Runnable examples from basic to advanced. Prefer the curated order below for onb
 | Example | What you learn |
 |---------|----------------|
 | [C/hello_blazedb.c](C/hello_blazedb.c) | Stable C ABI: open → put → get → free → delete → close |
-| [Go/README.md](Go/README.md) | Documented cgo recipe against `BlazeDBC` (no checked-in Go module yet) |
+| [Go/hello_blazedb.go](Go/hello_blazedb.go) | cgo smoke: job-queue-shaped byte-KV via `BlazeDBC` |
+| [Go/README.md](Go/README.md) | Build steps and planned module layout |
 
 See [C/README.md](C/README.md) for link flags after `swift build -c release --product BlazeDBC`.
+
+---
+
+## Application-shaped samples (not production deployments)
+
+These Swift files illustrate how a real app might structure models and RLS; they are **examples**, not shipped products or endorsements.
+
+| File | What it demonstrates |
+|------|----------------------|
+| [AshPileExample.swift](AshPileExample.swift) | Multi-tenant bug tracker sketch with `SecurityContext` and RLS |
+| [AshPileWithRLS.swift](AshPileWithRLS.swift) | RLS policy patterns on typed stores |
+
+Run from a unit test target or adapt into your app; there is no standalone `swift run AshPile` product today.
 
 ---
 
@@ -43,7 +57,7 @@ Labels used below:
 ### Default (shipped path)
 | File | Description |
 |------|-------------|
-| `HelloBlazeDB/main.swift` | Minimal default API path (`BlazeDB.open`, `put`, `get`, `query`) |
+| `HelloBlazeDB/main.swift` | Minimal default API path (`open`, `put`, `get`, `query`, `close`, reopen) |
 | `CorePathSmoke/main.swift` | Portable core-path smoke test (Linux/Android compile mode; runs on host) |
 | `BasicExample/main.swift` | Core CRUD operations |
 | `QuickStart.swift` | Minimal typed working example |

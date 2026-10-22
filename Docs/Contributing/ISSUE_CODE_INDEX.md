@@ -8,7 +8,7 @@ Evidence: `Proven` | `Strongly supported` | `Investigation`
 
 Hub: [LEARNING_PATHS](LEARNING_PATHS.md) · [CODEBASE_MAP](../Architecture/CODEBASE_MAP.md) · [ISSUE_GUIDE](ISSUE_GUIDE.md)
 
-Label filters used: `good first issue`, `durability`, `performance`, `concurrency`, `needs design`, plus roadmap-sized Now items and correctness defects. There is **no** `roadmap` GitHub label today: roadmap Now work is listed explicitly. **`help wanted`:** none currently open with that label. Prefer specific risk labels over a generic priority tag.
+Label filters used: `good first issue`, `durability`, `performance`, `concurrency`, `needs design`, plus roadmap-sized Now items and correctness defects. There is **no** `roadmap` GitHub label today: roadmap Now work is listed explicitly. **`help wanted`:** verify live with `gh issue list --label "help wanted"`. New contributors should start from [STARTER_TASKS.md](STARTER_TASKS.md), not the full GFI label search. Prefer specific risk labels over a generic priority tag.
 
 ---
 
@@ -63,7 +63,7 @@ Label filters used: `good first issue`, `durability`, `performance`, `concurrenc
 | Issue | Difficulty | Evidence | Files | Existing tests | Missing tests | Validation | Maintainer review |
 |-------|------------|----------|-------|----------------|---------------|------------|-------------------|
 | #263 | intermediate | Strongly supported | Compatibility fixtures + CI workflows | fixtures may skip today | non-skippable gate | CI workflow change | med |
-| #264 | intermediate | Proven | `Examples/Go/README.md` (no `.go` yet); `BlazeDBC` | `BlazeDBCSmokeTests` | Go/cgo CI | build BlazeDBC + planned go test | med |
+| #264 | intermediate | Proven | `Examples/Go/hello_blazedb.go`; `BlazeDBC` | `BlazeDBCSmokeTests` | Go/cgo CI gate | build BlazeDBC + `go run hello_blazedb.go` in CI | med |
 | #265 | intermediate | Strongly supported | `Examples/C/hello_blazedb.c`; release scripts | C example not always CI-linked | artifact + CI link | `swift build --product BlazeDBC` | med |
 | #266 | starter–intermediate | Strongly supported | schema docs under consolidation | `SchemaValidationTests` | n/a (docs) | schema guide + tests unchanged | low |
 | #267 | intermediate | Proven | `blazedb.h`, `BlazeDBC.swift` | smoke tests | last_error coverage | `BlazeDBCSmokeTests` + new | **ABI review** |

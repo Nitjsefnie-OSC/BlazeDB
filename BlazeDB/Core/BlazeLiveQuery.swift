@@ -9,6 +9,24 @@
 
 import Foundation
 
+/// Non-generic sink so `@Sendable` `observe` closures do not capture `T.Type` metatypes.
+fileprivate protocol BlazeLiveQueryRefreshable: AnyObject {
+    func refresh()
+}
+
+/// Non-generic so `@Sendable` `observe` does not close over `T.Type`.
+private final class BlazeLiveQueryRefreshSink: @unchecked Sendable {
+    private weak var target: (any BlazeLiveQueryRefreshable)?
+
+    func attach(_ query: any BlazeLiveQueryRefreshable) {
+        target = query
+    }
+
+    func notifyChange() {
+        target?.refresh()
+    }
+}
+
 /// Live query for a ``BlazeStorable`` model type.
 ///
 /// Wires ``BlazeDBClient/observe(_:)`` to a typed namespace query and delivers
@@ -43,23 +61,23 @@ import Foundation
 ///   synchronously calls ``refresh()`` once for an initial snapshot.
 /// - ``stop()`` invalidates the token. Safe to call repeatedly. After ``stop()``, database
 ///   changes do **not** trigger ``refresh()``.
-/// - ``deinit`` calls ``stop()``. No observer callbacks after deallocation.
+/// - On deallocation, ``stop()`` runs automatically. No observer callbacks after the instance is gone.
 /// - Manual ``refresh()`` remains valid after ``stop()``; it re-runs the query and invokes
 ///   ``onResults`` but does not re-register an observer.
 ///
 /// ### Threading
 ///
-/// - ``runQuery()`` executes on the thread that calls ``refresh()`` (usually the main queue
+/// - The internal query runs on the thread that calls ``refresh()`` (usually the main queue
 ///   after a batched change notification).
 /// - ``onResults`` is always invoked on the **main queue** (synchronously if already on main,
-///   otherwise via ``DispatchQueue.main.async``).
-/// - Non-UI callers (CLI, tests) must pump ``RunLoop.main`` to receive observer-driven
+///   otherwise dispatched asynchronously to the main queue).
+/// - Non-UI callers (CLI, tests) must pump the main run loop to receive observer-driven
 ///   callbacks within a bounded time (~150ms after writes is typical).
 ///
 /// ### Callback ordering
 ///
 /// - ``start()`` produces one initial ``onResults`` call before any write occurs.
-/// - After writes, delivery follows ``ChangeNotificationManager`` batching (~50ms), then
+/// - After writes, delivery follows internal change-notification batching (~50ms), then
 ///   ``refresh()`` → ``onResults``. Callback order matches commit order of batched flushes,
 ///   not individual sub-millisecond writes.
 /// - There is no guarantee that intermediate query states are delivered when writes arrive
@@ -67,7 +85,7 @@ import Foundation
 ///
 /// ### Coalescing
 ///
-/// - ``ChangeNotificationManager`` coalesces **change notifications** within ~50ms into one
+/// - Change notifications are coalesced within ~50ms into one
 ///   observer callback → one ``refresh()`` per flush.
 /// - ``BlazeLiveQuery`` does **not** coalesce overlapping ``refresh()`` calls. Slow queries
 ///   or writes across multiple batch windows may produce multiple ``onResults`` deliveries.
@@ -83,17 +101,11 @@ import Foundation
 /// ## Lifecycle / observer ownership
 ///
 /// ``BlazeLiveQuery`` owns the ``ObserverToken`` registered by ``start()``.
-/// Call ``stop()`` to unregister early, or rely on ``deinit`` (which calls ``stop()``).
-/// Do not call ``start()`` without a matching ``stop()`` or deallocation — leaked
-/// observers are prevented by explicit ``stop()`` / deinit, not by garbage collection alone.
+/// Call ``stop()`` to unregister early, or rely on deallocation (which calls ``stop()``).
+/// Do not call ``start()`` without a matching ``stop()`` or deallocation. Leaked
+/// observers are prevented by explicit ``stop()`` or instance teardown, not by garbage collection alone.
 public final class BlazeLiveQuery<T: BlazeStorable>: @unchecked Sendable {
     public typealias ResultsHandler = (Result<[T], Error>) -> Void
-
-    private final class RefreshBridge: @unchecked Sendable {
-        private weak var query: BlazeLiveQuery<T>?
-        func attach(_ query: BlazeLiveQuery<T>) { self.query = query }
-        func notify() { query?.refresh() }
-    }
 
     private let db: BlazeDBClient
     private let filters: [(field: String, comparison: BlazeQueryComparison, value: BlazeDocumentField)]
@@ -104,7 +116,7 @@ public final class BlazeLiveQuery<T: BlazeStorable>: @unchecked Sendable {
     private var observerToken: ObserverToken?
     private var resultsHandler: ResultsHandler?
     private let handlerLock = NSLock()
-    private let refreshBridge = RefreshBridge()
+    private let refreshSink = BlazeLiveQueryRefreshSink()
 
     /// - Parameters:
     ///   - db: Database client to observe and query.
@@ -130,7 +142,7 @@ public final class BlazeLiveQuery<T: BlazeStorable>: @unchecked Sendable {
         self.sortField = sortBy
         self.sortDescending = descending
         self.limitCount = limit
-        refreshBridge.attach(self)
+        refreshSink.attach(self)
     }
 
     /// Advanced initializer mirroring ``BlazeStorableQueryObserver`` filter tuples.
@@ -146,7 +158,7 @@ public final class BlazeLiveQuery<T: BlazeStorable>: @unchecked Sendable {
         self.sortField = sortBy
         self.sortDescending = descending
         self.limitCount = limit
-        refreshBridge.attach(self)
+        refreshSink.attach(self)
     }
 
     deinit {
@@ -173,8 +185,8 @@ public final class BlazeLiveQuery<T: BlazeStorable>: @unchecked Sendable {
     /// then synchronously calls ``refresh()`` for an initial snapshot.
     public func start() {
         stop()
-        observerToken = db.observe { [refreshBridge] _ in
-            refreshBridge.notify()
+        observerToken = db.observe { [refreshSink] _ in
+            refreshSink.notifyChange()
         }
         refresh()
     }
@@ -263,3 +275,5 @@ public final class BlazeLiveQuery<T: BlazeStorable>: @unchecked Sendable {
         }
     }
 }
+
+extension BlazeLiveQuery: BlazeLiveQueryRefreshable {}

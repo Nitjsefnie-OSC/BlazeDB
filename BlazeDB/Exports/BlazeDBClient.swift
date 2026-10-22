@@ -186,6 +186,10 @@ public enum BlazeCorruptionError: Error {
 
 // MARK: - BlazeDBClient
 
+/// Encrypted database client for BlazeDB.
+///
+/// **Most apps only need the <doc:DailyAPI>:** hold one client on `SeekerDatabase.shared`, then `put`, `get`, namespace `query`, and `delete`.
+/// This symbol page groups methods by task; the auto-generated list at the bottom is the full advanced reference.
 public final class BlazeDBClient: @unchecked Sendable {
     internal var collection: DynamicCollection
     public let name: String
@@ -246,6 +250,47 @@ public final class BlazeDBClient: @unchecked Sendable {
         }
 
         return (derivedKey, true)
+    }
+
+    /// If a signed layout exists but the given key does not verify it, probe the
+    /// known cross-context PBKDF2 iteration counts and return the key that does.
+    /// The verified key becomes the client key for both signing and page
+    /// encryption, so a database written in one KDF context opens in the other.
+    /// Falls back to the given key when no meta exists, the meta is not a
+    /// decodable secure layout, or no candidate verifies (existing error paths
+    /// then report the failure).
+    private static func reconcileKeyWithStoredLayout(
+        candidateKey: SymmetricKey,
+        metaURL: URL,
+        password: String,
+        kdfSalt: Data
+    ) -> SymmetricKey {
+        guard FileManager.default.fileExists(atPath: metaURL.path),
+              let data = try? Data(contentsOf: metaURL) else {
+            return candidateKey
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let secureLayout = try? decoder.decode(StorageLayout.SecureLayout.self, from: data) else {
+            return candidateKey
+        }
+        if secureLayout.verify(using: candidateKey) {
+            return candidateKey
+        }
+        for iterations in KeyManager.crossContextPBKDF2IterationCandidates {
+            guard let derived = try? KeyManager.deriveKeyPBKDF2(
+                password: Data(password.utf8),
+                salt: kdfSalt,
+                iterations: iterations,
+                keyLength: 32
+            ) else { continue }
+            let crossContextKey = SymmetricKey(data: derived)
+            if secureLayout.verify(using: crossContextKey) {
+                BlazeLogger.warn("Layout was signed under a different KDF context; adopting key derived with \(iterations) PBKDF2 iterations")
+                return crossContextKey
+            }
+        }
+        return candidateKey
     }
 
     private static func commitSessionIfNeeded(
@@ -325,20 +370,22 @@ public final class BlazeDBClient: @unchecked Sendable {
         }
 
         let salt = try SecureRandom.bytesStrict(count: 16)
-        try salt.write(to: saltURL, options: .atomic)
+        try SecureFileAttributes.writeOwnerOnly(salt, to: saltURL)
         return salt
     }
 
     // MARK: - Transaction Snapshot (V1.5: replaces file-copy transactions)
     // On beginTransaction, snapshot indexMap, secondaryIndexes, and baseline records.
     // On rollback, restore those structures under the collection barrier so readers cannot
-    // observe a half-rolled-back index/layout. Pages allocated in the txn are zeroed.
+    // observe a half-rolled-back index/layout. Pages the txn wrote are zeroed and the
+    // free-list is restored, so freed baseline pages cannot be handed out again.
     // Commit discards the snapshot only after persist + WAL checkpoint succeed.
     var transactionIndexMapSnapshot: [UUID: [Int]]?
     var transactionRecordSnapshot: [UUID: BlazeDataRecord]?
     var transactionSecondaryIndexesSnapshot: [String: [CompoundIndexKey: Set<UUID>]]?
     var transactionRangeIndexFieldsSnapshot: [String] = []
-    var transactionPagesWritten: [Int] = []  // pages allocated during this tx
+    var transactionFreePagesSnapshot: [Int] = []
+    var transactionNextPageIndexSnapshot: Int = 0
     
     // BLOCKER #2 FIX: Vacuum state management (internal for extensions)
     internal var isVacuuming: Bool = false
@@ -350,6 +397,22 @@ public final class BlazeDBClient: @unchecked Sendable {
     /// Thread-safe close state management
     private var _isClosedValue: Bool = false
     private let closedStateLock = NSLock()
+    private var _transactionRecoveryRequired = false
+
+    /// A failed rollback leaves the durable baseline as the only trustworthy state.
+    /// Reject operations until a new client restores that baseline on open.
+    internal var transactionRecoveryRequired: Bool {
+        get {
+            closedStateLock.lock()
+            defer { closedStateLock.unlock() }
+            return _transactionRecoveryRequired
+        }
+        set {
+            closedStateLock.lock()
+            defer { closedStateLock.unlock() }
+            _transactionRecoveryRequired = newValue
+        }
+    }
     
     /// Internal flag tracking close state (thread-safe)
     internal var _isClosed: Bool {
@@ -372,7 +435,7 @@ public final class BlazeDBClient: @unchecked Sendable {
     internal let encryptionKey: SymmetricKey
 
     @inline(__always)
-    private var shouldEnforceRLS: Bool {
+    internal var shouldEnforceRLS: Bool {
         rls.isEnabled() && rls.hasPolicies()
     }
 
@@ -476,7 +539,15 @@ public final class BlazeDBClient: @unchecked Sendable {
             password: password,
             kdfSalt: kdfSalt
         )
-        let key = keyResolution.key
+        // The PBKDF2 iteration count is context-dependent (production vs XCTest),
+        // so an existing layout may be signed with a key this context cannot
+        // re-derive from password+salt alone. Adopt the key that verifies it.
+        let key = Self.reconcileKeyWithStoredLayout(
+            candidateKey: keyResolution.key,
+            metaURL: metaURL,
+            password: password,
+            kdfSalt: kdfSalt
+        )
         let pendingSessionInstall = keyResolution.pendingSessionInstall
         self.encryptionKey = key
 
@@ -813,6 +884,63 @@ public final class BlazeDBClient: @unchecked Sendable {
 
     // MARK: - CRUD
 
+    /// Shared validation and before-insert transforms for all public insert entry points.
+    private func prepareRecordForInsert(
+        _ data: BlazeDataRecord,
+        explicitID: UUID? = nil
+    ) throws -> (record: BlazeDataRecord, id: UUID) {
+        var record = data
+        let id: UUID
+        if let explicitID {
+            id = explicitID
+            record.storage["id"] = .uuid(id)
+        } else if case let .uuid(existingID)? = record.storage["id"] {
+            id = existingID
+        } else if case let .string(idStr)? = record.storage["id"], let parsed = UUID(uuidString: idStr) {
+            id = parsed
+            record.storage["id"] = .uuid(parsed)
+        } else {
+            id = UUID()
+            record.storage["id"] = .uuid(id)
+        }
+
+        if record.storage["createdAt"] == nil {
+            record.storage["createdAt"] = .date(Date())
+        }
+
+        try validateAgainstSchema(record)
+
+        var modifiedRecord: BlazeDataRecord? = record
+        try triggerManager.executeTriggers(for: .beforeInsert, record: record, modifiedRecord: &modifiedRecord)
+        try executeEnhancedTriggers(
+            for: .beforeInsert,
+            record: record,
+            modifiedRecord: &modifiedRecord,
+            collection: collection,
+            collectionName: name
+        )
+        let recordToInsert = modifiedRecord ?? record
+
+        try enforceRLS(.insert, record: recordToInsert)
+        try validateForeignKeys(for: recordToInsert, operation: "insert")
+        try validateCheckConstraints(in: recordToInsert)
+        try validateUniqueConstraints(in: recordToInsert)
+
+        return (recordToInsert, id)
+    }
+
+    private func runAfterInsertTriggers(for record: BlazeDataRecord) throws {
+        var modifiedRecord: BlazeDataRecord? = record
+        try triggerManager.executeTriggers(for: .afterInsert, record: record, modifiedRecord: &modifiedRecord)
+        try executeEnhancedTriggers(
+            for: .afterInsert,
+            record: record,
+            modifiedRecord: &modifiedRecord,
+            collection: collection,
+            collectionName: name
+        )
+    }
+
     /// Inserts a new record into the database.
     ///
     /// If the record doesn't have an `id` field, a new UUID will be generated automatically.
@@ -834,53 +962,15 @@ public final class BlazeDBClient: @unchecked Sendable {
         let startTime = Date()
         
         do {
-            var record = data
-            let id: UUID
-            if case let .uuid(existingID)? = record.storage["id"] {
-                id = existingID
-            } else if case let .string(idStr)? = record.storage["id"], let parsed = UUID(uuidString: idStr) {
-                id = parsed
-                record.storage["id"] = .uuid(parsed) // normalize to uuid
-            } else {
-                id = UUID()
-                record.storage["id"] = .uuid(id)
-            }
+            let prepared = try prepareRecordForInsert(data)
 
-            if record.storage["createdAt"] == nil {
-                record.storage["createdAt"] = .date(Date())
-            }
+            try performSafeWrite { _ = try collection.insert(prepared.record) }
+            legacyTransactionLogNoOp("insert", payload: prepared.record.storage)
             
-            // Validate against schema (if defined)
-            try validateAgainstSchema(record)
-            
-            // Execute BEFORE INSERT triggers
-            var modifiedRecord: BlazeDataRecord? = record
-            try triggerManager.executeTriggers(for: .beforeInsert, record: record, modifiedRecord: &modifiedRecord)
-            // Execute enhanced triggers
-            try executeEnhancedTriggers(for: .beforeInsert, record: record, modifiedRecord: &modifiedRecord, collection: collection, collectionName: name)
-            let recordToInsert = modifiedRecord ?? record
-
-            try enforceRLS(.insert, record: recordToInsert)
-            
-            // Validate foreign keys
-            try validateForeignKeys(for: recordToInsert, operation: "insert")
-            
-            // Validate check constraints
-            try validateCheckConstraints(in: recordToInsert)
-            
-            // Validate unique constraints
-            try validateUniqueConstraints(in: recordToInsert)
-
-            try performSafeWrite { _ = try collection.insert(recordToInsert) }
-            legacyTransactionLogNoOp("insert", payload: recordToInsert.storage)
-            
-            // Execute AFTER INSERT triggers
-            try triggerManager.executeTriggers(for: .afterInsert, record: recordToInsert, modifiedRecord: &modifiedRecord)
-            // Execute enhanced triggers
-            try executeEnhancedTriggers(for: .afterInsert, record: recordToInsert, modifiedRecord: &modifiedRecord, collection: collection, collectionName: name)
+            try runAfterInsertTriggers(for: prepared.record)
             
             // Notify change observers (for sync)
-            notifyInsert(id: id)
+            notifyInsert(id: prepared.id)
             
             #if !BLAZEDB_LINUX_CORE
             // Track telemetry (if enabled)
@@ -888,7 +978,7 @@ public final class BlazeDBClient: @unchecked Sendable {
             telemetry.record(operation: "insert", duration: insertDuration, success: true, recordCount: 1)
             #endif
             
-            return id
+            return prepared.id
         } catch {
             #if !BLAZEDB_LINUX_CORE
             // Track telemetry for failure
@@ -901,17 +991,11 @@ public final class BlazeDBClient: @unchecked Sendable {
 
     /// Insert a record with a specific UUID (for transaction tests and deterministic inserts)
     public func insert(_ data: BlazeDataRecord, id: UUID) throws {
-        var record = data
-        record.storage["id"] = .uuid(id)
-        if record.storage["createdAt"] == nil {
-            record.storage["createdAt"] = .date(Date())
-        }
-        try enforceRLS(.insert, record: record)
-        try performSafeWrite { _ = try collection.insert(record) }
-        legacyTransactionLogNoOp("insert", payload: record.storage)
-        
-        // Notify change observers (for sync)
-        notifyInsert(id: id)
+        let prepared = try prepareRecordForInsert(data, explicitID: id)
+        try performSafeWrite { _ = try collection.insert(prepared.record) }
+        legacyTransactionLogNoOp("insert", payload: prepared.record.storage)
+        try runAfterInsertTriggers(for: prepared.record)
+        notifyInsert(id: prepared.id)
     }
     
     /// Insert multiple records in a single batch (much faster than individual inserts)
@@ -925,32 +1009,39 @@ public final class BlazeDBClient: @unchecked Sendable {
         let startTime = Date()
         
         do {
-            if shouldEnforceRLS {
-                for record in records {
-                    try enforceRLS(.insert, record: record)
-                }
+            var preparedRecords: [BlazeDataRecord] = []
+            preparedRecords.reserveCapacity(records.count)
+            for record in records {
+                let prepared = try prepareRecordForInsert(record).record
+                // Durable uniqueness is checked in prepare; also reject duplicates among
+                // not-yet-written siblings so insertMany matches sequential insert().
+                try validateUniqueConstraintsAgainstPending(in: prepared, pending: preparedRecords)
+                preparedRecords.append(prepared)
             }
+
             var ids: [UUID] = []
             try performSafeWrite {
                 #if !BLAZEDB_LINUX_CORE
                 // Use optimized batch insert (3-5x faster!)
-                ids = try collection.insertBatch(records)
+                ids = try collection.insertBatch(preparedRecords)
                 #else
                 // Linux: Fallback to individual inserts
-                for record in records {
+                for record in preparedRecords {
                     let id = try collection.insert(record)
                     ids.append(id)
                 }
                 #endif
                 
                 // Log to transaction log
-                for (index, _) in ids.enumerated() {
-                    if index < records.count {
-                        legacyTransactionLogNoOp("insert", payload: records[index].storage)
-                    }
+                for (index, record) in preparedRecords.enumerated() where index < ids.count {
+                    legacyTransactionLogNoOp("insert", payload: record.storage)
                 }
             }
             BlazeLogger.info("Inserted \(ids.count) records in optimized batch")
+
+            for (index, record) in preparedRecords.enumerated() where index < ids.count {
+                try runAfterInsertTriggers(for: record)
+            }
             
             // Notify change observers (for sync) - batch notification
             let changes = ids.map { DatabaseChange(type: .insert($0), collectionName: name) }
@@ -975,8 +1066,8 @@ public final class BlazeDBClient: @unchecked Sendable {
     
     /// Update multiple records matching a predicate
     /// - Parameters:
-    ///   - where: Predicate to match records
-    ///   - set: Fields to update
+    ///   - predicate: Records matching this closure are updated
+    ///   - fields: Field values to set on matched records
     /// - Returns: Number of records updated
     public func updateMany(where predicate: @escaping (BlazeDataRecord) -> Bool, set fields: [String: BlazeDocumentField]) throws -> Int {
         var updateCount = 0
@@ -1012,6 +1103,8 @@ public final class BlazeDBClient: @unchecked Sendable {
                     updated.storage[key] = value
                 }
                 updated.storage["updatedAt"] = .date(Date())
+                // WITH CHECK: resulting row must also pass UPDATE policy (#335)
+                try enforceRLS(.update, record: updated)
                 try collection.update(id: id, with: updated)
                 updateCount += 1
             }
@@ -1092,7 +1185,7 @@ public final class BlazeDBClient: @unchecked Sendable {
     }
     
     /// Delete multiple records matching a predicate
-    /// - Parameter where: Predicate to match records
+    /// - Parameter predicate: Records matching this closure are deleted
     /// - Returns: Number of records deleted
     public func deleteMany(where predicate: @escaping (BlazeDataRecord) -> Bool) throws -> Int {
         var deleteCount = 0
@@ -1347,6 +1440,9 @@ public final class BlazeDBClient: @unchecked Sendable {
         try executeEnhancedTriggers(for: .beforeUpdate, record: existingRecord, modifiedRecord: &modifiedRecord, collection: collection, collectionName: name)
         let recordToUpdate = modifiedRecord ?? data
         
+        // WITH CHECK: resulting row must also pass UPDATE policy (#335)
+        try enforceRLS(.update, record: recordToUpdate)
+        
         // Validate foreign keys
         try validateForeignKeys(for: recordToUpdate, operation: "update")
         
@@ -1558,6 +1654,8 @@ public final class BlazeDBClient: @unchecked Sendable {
     /// Manually flush pending metadata changes to disk
     /// Useful when you need to ensure data is persisted before critical operations
     public func persist() throws {
+        writeLock.lock()
+        defer { writeLock.unlock() }
         try ensureNotClosed()
         try collection.persist()
         
@@ -1570,7 +1668,7 @@ public final class BlazeDBClient: @unchecked Sendable {
     /// Alias for persist() - flushes pending metadata to disk
     @available(*, deprecated, message: "Use persist() instead. persist() syncs data to disk and finalizes the transaction log. flush() did the same sync but left the transaction log in place, which is rarely the intended behavior.")
     public func flush() throws {
-        try collection.persist()
+        try persist()
     }
     
     // MARK: - JOIN Operations
@@ -1690,6 +1788,10 @@ public final class BlazeDBClient: @unchecked Sendable {
         // We don't check here to allow query builder construction
         let builder: QueryBuilder = collection.query()
         if shouldEnforceRLS {
+            let rls = self.rls
+            builder.cachePartitionProvider = { [weak rls] in
+                rls?.queryCachePartition() ?? "rls-deallocated"
+            }
             _ = builder.where { [rls] record in
                 rls.isAllowed(operation: .select, record: record)
             }
@@ -1705,6 +1807,9 @@ public final class BlazeDBClient: @unchecked Sendable {
     /// try db.createIndex(on: "status")
     /// ```
     public func createIndex(on field: String) throws {
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        try ensureNotClosed()
         try collection.createIndex(on: field)
     }
 
@@ -1714,6 +1819,9 @@ public final class BlazeDBClient: @unchecked Sendable {
     /// try db.createIndex(on: ["status", "priority"])
     /// ```
     public func createIndex(on fields: [String]) throws {
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        try ensureNotClosed()
         try collection.createIndex(on: fields)
     }
 
@@ -1740,20 +1848,23 @@ public final class BlazeDBClient: @unchecked Sendable {
     /// The non-async, non-escaping closure type gives compile-time protection against
     /// direct `await` usage inside this critical section.
     internal func performSafeWrite(_ block: () throws -> Void) throws {
-        try ensureNotClosed()
         writeLock.lock()
         defer { writeLock.unlock() }
+        try ensureNotClosed()
 
         // When an explicit transaction is active, rollback is handled by
         // the transaction snapshot. Skip per-write overhead.
         if transactionIndexMapSnapshot != nil {
             try block()
             QueryCache.shared.notifyWrite()
+            #if !BLAZEDB_LINUX_CORE
+            collection.invalidateQueryCacheSync()
+            #endif
             return
         }
 
         // Snapshot indexMap on the collection queue so rollback does not race with fetch().
-        let indexMapBackup = try collection.queue.sync(flags: .barrier) {
+        let indexMapBackup = collection.queue.sync(flags: .barrier) {
             collection.indexMap
         }
 
@@ -1761,14 +1872,20 @@ public final class BlazeDBClient: @unchecked Sendable {
             try block()
             // Invalidate query cache after successful write
             QueryCache.shared.notifyWrite()
+            #if !BLAZEDB_LINUX_CORE
+            collection.invalidateQueryCacheSync()
+            #endif
         } catch {
             BlazeLogger.error("Rolling back write due to error: \(error)")
-            try collection.queue.sync(flags: .barrier) {
+            collection.queue.sync(flags: .barrier) {
                 collection.indexMap = indexMapBackup
                 collection.store.pageCache.clear()
                 collection.recordCache.clear()
             }
             QueryCache.shared.clearAll()
+            #if !BLAZEDB_LINUX_CORE
+            collection.invalidateQueryCacheSync()
+            #endif
             throw error
         }
     }
@@ -1852,12 +1969,20 @@ public final class BlazeDBClient: @unchecked Sendable {
     /// - Always call commit or rollback to clean up transaction state
     /// - Transactions provide ACID guarantees and crash-safe rollback semantics.
     public func beginTransaction() throws {
-        try ensureNotClosed()
         writeLock.lock()
         defer { writeLock.unlock() }
+        try ensureNotClosed()
 
         guard transactionIndexMapSnapshot == nil else {
             throw BlazeDBError.transactionFailed("Transaction already in progress")
+        }
+        // A rollback that could not finish leaves its durable backup behind. Starting a new
+        // transaction would overwrite that backup with the half-restored file, so fail closed:
+        // reopening the database restores the pre-transaction state from the backup.
+        if FileManager.default.fileExists(atPath: transactionStateURL.path) {
+            throw BlazeDBError.transactionFailed(
+                "A previous transaction rollback did not complete; reopen the database to restore its pre-transaction backup"
+            )
         }
 
         // Persist all in-memory changes before snapshotting
@@ -1879,13 +2004,15 @@ public final class BlazeDBClient: @unchecked Sendable {
                     baselineRecords[id] = record
                 }
             }
-            return (indexMap, collection.secondaryIndexes, baselineRecords)
+            return (indexMap, collection.secondaryIndexes, baselineRecords,
+                    collection.cachedDeletedPages, collection.nextPageIndex)
         }
         transactionIndexMapSnapshot = snapshot.0
         transactionSecondaryIndexesSnapshot = snapshot.1
         transactionRecordSnapshot = snapshot.2
+        transactionFreePagesSnapshot = snapshot.3
+        transactionNextPageIndexSnapshot = snapshot.4
         transactionRangeIndexFieldsSnapshot = collection.btreeIndexManager.indexNames
-        transactionPagesWritten = []
 
         metrics.incrementTransactionsStarted()
         BlazeLogger.debug("Transaction started (indexMap snapshot: \(snapshot.0.count) records)")
@@ -1906,9 +2033,9 @@ public final class BlazeDBClient: @unchecked Sendable {
     /// try db.commitTransaction()  // Both operations persisted atomically
     /// ```
     public func commitTransaction() throws {
-        try ensureNotClosed()
         writeLock.lock()
         defer { writeLock.unlock() }
+        try ensureNotClosed()
 
         guard transactionIndexMapSnapshot != nil else {
             throw BlazeDBError.transactionFailed("No transaction in progress")
@@ -1927,11 +2054,7 @@ public final class BlazeDBClient: @unchecked Sendable {
         }
 
         // Discard snapshot — changes are now permanent
-        transactionIndexMapSnapshot = nil
-        transactionRecordSnapshot = nil
-        transactionSecondaryIndexesSnapshot = nil
-        transactionRangeIndexFieldsSnapshot = []
-        transactionPagesWritten = []
+        clearInMemoryTransactionState()
         clearDurableTransactionArtifacts()
 
         metrics.incrementTransactionsCommitted()
@@ -1956,39 +2079,72 @@ public final class BlazeDBClient: @unchecked Sendable {
     /// }
     /// ```
     public func rollbackTransaction() throws {
-        try ensureNotClosed()
         writeLock.lock()
         defer { writeLock.unlock() }
+        try ensureNotClosed()
 
         guard let snapshot = transactionIndexMapSnapshot else {
             throw BlazeDBError.transactionFailed("No transaction to roll back")
         }
         let baselineRecords = transactionRecordSnapshot ?? [:]
+        let freePagesSnapshot = transactionFreePagesSnapshot
+        let nextPageIndexSnapshot = transactionNextPageIndexSnapshot
+        // Whatever happens below, this transaction is over: never leave the client wedged
+        // on "Transaction already in progress". If the restore throws, the durable backup
+        // stays on disk (see beginTransaction) and reopening restores it.
+        var rollbackSucceeded = false
+        defer {
+            if !rollbackSucceeded { transactionRecoveryRequired = true }
+            clearInMemoryTransactionState()
+        }
 
         try collection.queue.sync(flags: .barrier) {
+            let txnIndexMap = collection.indexMap
+            let txnNextPageIndex = collection.nextPageIndex
+
             // Restore indexMap to pre-transaction state
             collection.indexMap = snapshot
             if let secondarySnapshot = transactionSecondaryIndexesSnapshot {
                 collection.secondaryIndexes = secondarySnapshot
             }
 
-            // Restore pre-transaction payloads for records that still exist.
-            // Without this, in-place updates can survive rollback even if indexMap is restored.
+            // Restore pre-transaction payloads for every baseline record, including ones
+            // deleted in the transaction (delete zeroes their pages). Records larger than
+            // one page span an overflow chain, so rewrite the whole chain onto the
+            // record's original pages; a plain writePage cannot hold them and threw here.
             for (id, pages) in snapshot {
                 guard let pageIndex = pages.first, let baseline = baselineRecords[id] else { continue }
                 let encoded = try BlazeBinaryEncoder.encodeOptimized(baseline)
-                try collection.store.writePage(index: pageIndex, data: encoded)
+                var originalChain = pages.dropFirst().makeIterator()
+                collection.indexMap[id] = try collection.store.writePageWithOverflow(
+                    index: pageIndex,
+                    plaintext: encoded,
+                    allocatePage: {
+                        if let page = originalChain.next() { return page }
+                        defer { collection.nextPageIndex += 1 }
+                        return collection.nextPageIndex
+                    }
+                )
             }
+            let restoredPages = Set(collection.indexMap.values.joined())
 
-            // Zero out pages that were allocated during this transaction
-            // (they contain data that should not be visible after rollback)
-            for pageIndex in transactionPagesWritten {
+            // Zero pages that hold discarded in-transaction data (new records, new versions),
+            // so neither reads nor a layout rebuild from pages can resurrect them.
+            let txnPages = Set(txnIndexMap.values.joined())
+                .union(nextPageIndexSnapshot..<txnNextPageIndex)
+                .subtracting(restoredPages)
+            for pageIndex in txnPages.sorted() {
                 do {
                     try collection.store.deletePage(index: pageIndex)
                 } catch {
                     BlazeLogger.warn("rollbackTransaction: could not delete staged page \(pageIndex): \(error.localizedDescription)")
                 }
             }
+
+            // Restore the free-list. Pages freed by in-transaction deletes belong to restored
+            // records again; leaving them free lets the next insert overwrite those records.
+            collection.cachedDeletedPages = freePagesSnapshot.filter { !restoredPages.contains($0) }
+                + (nextPageIndexSnapshot..<txnNextPageIndex).filter { !restoredPages.contains($0) }
 
             // Clear caches so reads reflect rolled-back state
             collection.store.pageCache.clear()
@@ -2009,16 +2165,28 @@ public final class BlazeDBClient: @unchecked Sendable {
             try collection.store.synchronize()
         }
 
-        // Discard transaction state
+        // Writes during the transaction invalidate query caches, but a subsequent
+        // cached query can repopulate them with in-transaction results. Clear both
+        // caches after restore so rollback cannot return discarded rows.
+        QueryCache.shared.clearAll()
+        #if !BLAZEDB_LINUX_CORE
+        collection.invalidateQueryCacheSync()
+        #endif
+
+        clearDurableTransactionArtifacts()
+        rollbackSucceeded = true
+
+        metrics.incrementTransactionsAborted()
+        BlazeLogger.info("Transaction rolled back (indexMap restored to \(snapshot.count) records)")
+    }
+
+    private func clearInMemoryTransactionState() {
         transactionIndexMapSnapshot = nil
         transactionRecordSnapshot = nil
         transactionSecondaryIndexesSnapshot = nil
         transactionRangeIndexFieldsSnapshot = []
-        transactionPagesWritten = []
-        clearDurableTransactionArtifacts()
-
-        metrics.incrementTransactionsAborted()
-        BlazeLogger.info("Transaction rolled back (indexMap restored to \(snapshot.count) records)")
+        transactionFreePagesSnapshot = []
+        transactionNextPageIndexSnapshot = 0
     }
 
     // MARK: - Migration

@@ -19,7 +19,7 @@ Add to your `Package.swift`:
 
 ```swift
 dependencies: [
- .package(url: "https://github.com/Mikedan37/BlazeDB.git", from: "2.8.1")
+ .package(url: "https://github.com/Mikedan37/BlazeDB.git", from: "2.8.2")
 ],
 targets: [
  .target(name: "YourApp", dependencies: ["BlazeDB"])
@@ -38,7 +38,7 @@ cd BlazeDB
 swift run HelloBlazeDB
 ```
 
-If you see "Success!", BlazeDB is working.
+If you see `Success (persisted across reopen)`, BlazeDB is working.
 
 ---
 
@@ -49,18 +49,18 @@ Copy into your project. Same flow as [README Start Here](../../README.md#start-h
 ```swift
 import BlazeDB
 
-struct Bug: BlazeStorable {
+struct Note: BlazeStorable {
     var id: UUID = UUID()
     var title: String
-    var status: String
+    var body: String
 }
 
 let db = try BlazeDB.open(name: "myapp", password: "DemoPass123!")
-let bug = Bug(title: "Crash", status: "open")
-try db.put(bug)
-let loaded: Bug? = try db.get("bug:\(bug.id.uuidString)")
-let openBugs: [Bug] = try db.query("bug")
-    .where("status", equals: "open")
+let note = Note(title: "Groceries", body: "Milk and eggs")
+try db.put(note)
+let loaded: Note? = try db.get("note:\(note.id.uuidString)")
+let matches: [Note] = try db.query("note")
+    .where("title", equals: "Groceries")
     .all()
 ```
 

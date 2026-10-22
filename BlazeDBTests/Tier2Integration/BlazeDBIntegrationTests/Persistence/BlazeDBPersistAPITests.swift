@@ -27,11 +27,9 @@ final class BlazeDBPersistAPITests: XCTestCase {
     }
     
     func cleanupTestURL(_ url: URL) {
-        try? FileManager.default.removeItem(at: url)
-        try? FileManager.default.removeItem(at: url.deletingPathExtension().appendingPathExtension("meta"))
-        try? FileManager.default.removeItem(at: url.deletingPathExtension().appendingPathExtension("meta.indexes"))
+        removeBlazeDBTestFiles(at: url)
     }
-    
+
     // MARK: - persist() Tests
     
     func testPersistForcesMetadataFlush() throws {
@@ -324,13 +322,18 @@ final class BlazeDBPersistAPITests: XCTestCase {
             _ = try db.insert(BlazeDataRecord(["index": .int(i)]))
         }
         
-        // Measure persist time
         let start = Date()
         try db.persist()
         let duration = Date().timeIntervalSince(start)
         
-        // Should be fast (< 100ms for 1000 records)
-        XCTAssertLessThan(duration, 0.1, "persist() should be fast")
+        // Local dev: tight bar. CI: regression guard only (shared runners are noisy).
+        let maxPersistSeconds: TimeInterval =
+            ProcessInfo.processInfo.environment["CI"] != nil ? 0.5 : 0.1
+        XCTAssertLessThan(
+            duration,
+            maxPersistSeconds,
+            "persist() should be fast (< \(maxPersistSeconds)s, was \(String(format: "%.3f", duration))s)"
+        )
     }
     
     func testAutomaticFlushAt100Operations() throws {

@@ -87,8 +87,11 @@ extension BlazeDBClient {
         BlazeLogger.info("Starting backup to \(url.path)")
         let startTime = Date()
         
-        // Ensure all pending changes are persisted before backup
+        // Ensure all pending changes are persisted before backup.
+        // Commit lives in the WAL until checkpoint, and this copy does not include
+        // the WAL, so the main file has to contain those pages first.
         try persist()
+        try collection.store.checkpoint()
         
         // Count records for stats
         let recordCount = try count()
@@ -341,7 +344,7 @@ extension BlazeDBClient {
     /// Export specific records matching a query
     ///
     /// - Parameters:
-    ///   - where: Predicate to filter records
+    ///   - predicate: Filter closure for records to export
     ///   - format: Export format
     /// - Returns: Encoded data of matching records
     ///
@@ -500,7 +503,7 @@ extension BlazeDBClient {
     ///
     /// - Parameters:
     ///   - url: Destination URL
-    ///   - since: Only export records modified after this date
+    ///   - date: Only export records modified after this date
     /// - Returns: Backup statistics
     ///
     /// ## Example

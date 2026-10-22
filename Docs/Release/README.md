@@ -5,6 +5,7 @@ This folder contains release-related documentation and checklists.
 ## Files
 
 - **RELEASE.md** - Canonical release runbook (tag -> CI -> GitHub release)
+- **CONTRIBUTORS.md** - Contributor roster and release credit notes
 - **FINAL_RELEASE_STATUS.md** - Final release status summary
 - **RELEASE_READINESS_CHECKLIST.md** - Checklist for release readiness
 

@@ -1,7 +1,9 @@
 # BlazeDB Adoption Readiness
 
-**Date:** 2025-01-23
-**Status:** Ready for early adopters
+**Date:** 2025-01-23 (narrative); **public summary updated:** 2026-10-16  
+**Status:** Ready for early adopters on the **default embedded core** — see [Support and limitations](../Support/SUPPORT_AND_LIMITATIONS.md) for the current platform matrix and security review status.
+
+> **Navigation:** Prefer [SUPPORT_AND_LIMITATIONS.md](../Support/SUPPORT_AND_LIMITATIONS.md) over this file for evaluator-facing claims. Release level is **v2.8.2**, not v0.1.0-beta.
 
 ---
 
@@ -36,10 +38,12 @@
 
 ### Not Suitable For
 
-1. **Multi-process applications**
-- BlazeDB is single-writer
-- Multiple processes will corrupt data
-- Use PostgreSQL, MySQL, or similar instead
+1. **Uncoordinated multi-process file access**
+- One process must own writes to a given `.blazedb` file
+- Multiple processes opening the same file for write without an owner risks lock failure or corruption
+- On macOS/Linux, use a **single daemon/service + queue** (Vapor, CLI owner, C ABI worker) — not separate uncoordinated opens
+- On iOS, embed in the app; a separate cross-app daemon is usually not viable
+- For many independent writers at SQL scale, use PostgreSQL, MySQL, or similar
 
 2. **Network filesystems**
 - NFS, SMB, cloud storage mounts
